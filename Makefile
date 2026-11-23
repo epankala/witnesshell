@@ -1,0 +1,50 @@
+# witnesshell build. Produces fully static Linux binaries (CGO disabled).
+
+GO      ?= go
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+ARCHES  ?= amd64 arm64
+DIST    := dist
+PKG     := witnesshell
+
+LDFLAGS := -s -w -buildid= \
+	-X $(PKG)/internal/version.Version=$(VERSION) \
+	-X $(PKG)/internal/version.Commit=$(COMMIT)
+
+export CGO_ENABLED := 0
+
+.PHONY: all build check fmt-check vet test verify-static clean
+
+all: check build verify-static
+
+build: $(foreach a,$(ARCHES),$(DIST)/witnesshell-linux-$(a))
+
+$(DIST)/witnesshell-linux-%: FORCE
+	@mkdir -p $(DIST)
+	GOOS=linux GOARCH=$* $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $@ ./cmd/witnesshell
+
+check: fmt-check vet test
+
+fmt-check:
+	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+
+vet:
+	$(GO) vet ./...
+
+test:
+	$(GO) test ./...
+
+# A static ELF has no PT_INTERP program header and no .dynamic section.
+verify-static: build
+	@for f in $(DIST)/witnesshell-linux-*; do \
+		if readelf -lW $$f | grep -q 'Requesting program interpreter' || \
+		   readelf -dW $$f | grep -q 'Dynamic section'; then \
+			echo "NOT static: $$f"; exit 1; \
+		fi; \
+		echo "static: $$f ($$(du -h $$f | cut -f1))"; \
+	done
+
+clean:
+	rm -rf $(DIST)
+
+FORCE:
