@@ -1,7 +1,22 @@
-# witnesshell — design & implementation plan (DRAFT v0.1)
+# witnesshell — design & implementation plan (DRAFT v0.2)
 
 > Status: draft. Items marked **[Q#]** depend on open questions (see end).
 > Each has a recommended default so the plan is complete as written.
+
+## 0. Decisions so far (2026-11-23)
+
+| # | Decision |
+|---|---|
+| D1 | Guard against **accidental and malicious** commands *and file edits* → enforcement mode |
+| D2 | Shell commands must be enforced, not just "assisted" → gate on the PTY input stream (§4) |
+| D3 | Witnesses see full-screen program output (live mirror of the terminal) |
+| D4 | Approval policy is **K-of-N** (e.g. 1-of-1, 2-of-3) |
+| D5 | Any user with a login on the remote host can witness (except the actor's own uid) |
+| D6 | Requests wait in a queue. Actor logs out → queue is purged |
+| D7 | Shell runs as the target (login) user; `sudo` is used inside the session for root |
+| D8 | UDP can be opened on the remote host. The client is installed locally. The remote IP is fixed; the client IP may change; a broken connection on an IP change is acceptable |
+| D9 | Recording: **asciicast v2** (asciinema format), plus markers for approved commands (§8) |
+| D10 | Remote: Linux only. Clients: Linux only |
 
 ## 1. Goal
 
@@ -48,10 +63,10 @@ sleep/resume).
    only one session is eligible, the client picks it automatically. Otherwise
    it shows a list.
 
-## 3. Threat model **[Q1]**
+## 3. Threat model (decided: enforcement, D1)
 
-Recommended default: **enforcement mode**. The actor is not trusted to bypass
-the gate on purpose. That forces the following:
+The actor may try to get around the gate on purpose. That forces the
+following:
 
 | Requirement | Why |
 |---|---|
@@ -61,10 +76,30 @@ the gate on purpose. That forces the following:
 | Actor uid ≠ witness uid, and the witness must be authorised for that actor | Prevents self-witnessing |
 | No port forwarding, agent forwarding or sftp for actor accounts | Those are side channels around the gate |
 
-Cooperative mode is the lighter alternative: a safety net against mistakes,
-with nobody assumed malicious. It could run without a root daemon and use
-shell integration, which keeps tab completion. The architecture below
-supports adding it later as a flag.
+**Why gating only "shell commands" can be bypassed.** Hooking the shell
+(bash `DEBUG` trap, `PROMPT_COMMAND`, `bind -x` on Enter) only sees what
+*that bash* parses. The actor can get around it in several ways:
+- Disable the hook: `trap - DEBUG`, `bind -r`, `unset PROMPT_COMMAND`.
+- Start a shell without the hook: `exec sh`, `bash --norc`, `busybox sh`.
+- Run commands from inside a program the shell only saw as one command:
+  `python3`, then `os.system(...)`; `vim`, then `:!rm …`; `less`, then
+  `!cmd`; `mysql \!`; `gdb shell`; `git` hooks or pagers; `awk 'BEGIN{system(...)}'`.
+- Edit files in vim, nano or `ed`. That is not a shell command at all.
+
+So witnesshell does not trust the shell. Every byte sent to the PTY must be
+approved, whatever program reads it. Shell integration (OSC 133 prompt
+marks) is used only to label things in the UI, never for security.
+
+**Role assignment** (follows the original idea: first one in is the actor):
+- All users who may use the host get `ForceCommand witnesshell bootstrap`
+  (`Match Group witnesshell`).
+- Bootstrap logic:
+  - No active session by another user: start a new session; this user is
+    the **actor**.
+  - Otherwise: offer to join an existing session as **witness** (pick one
+    from a list if there are several). **[Q14]**
+- A "break-glass" route for admins (console, or a separate un-forced
+  admin account) stays outside witnesshell and is documented as such.
 
 ## 4. Gating model **[Q2][Q3]**
 
@@ -85,8 +120,9 @@ small allow-list.
   line. Possible later addition: a server-side filename completer that only
   reads the filesystem (no execution).
 - The input state of the PTY is checked through termios. If ECHO is off (a
-  password prompt), the witness sees `«hidden input, 14 chars»`. Approval is
-  still required.
+  password prompt, e.g. `sudo`), the witness sees `«hidden input, 14 chars»`.
+  Approval is **still required**, because `stty -echo` could otherwise be
+  used to switch the gate off.
 
 ### 4.2 Allow-list (passes immediately, configurable)
 `Ctrl-C` (SIGINT), `Ctrl-\`, and window resize. `Ctrl-Z` and `Ctrl-D` are
@@ -104,31 +140,53 @@ gated by default: Ctrl-D can confirm prompts, and Ctrl-Z leads to job control.
 - Side effect: a full-screen app (the alternate screen is active) gets no
   input until a grant is approved. The UI shows a hint about this.
 
-### 4.4 Approval policy **[Q4]**
-- Configurable per actor: `any` (1 of N), `all`, or `quorum:K`.
-  Default: `any`, and **any rejection vetoes**.
+### 4.4 Approval policy (decided: K-of-N, D4)
+- `approvals_required = K` (default 1). Requests wait until K distinct
+  witnesses approve. A witness's uid counts once, even if that witness is
+  logged in twice.
+- Whether **any rejection vetoes** is still open. **[Q15]**
 - A rejection can carry a short reason, which the actor sees.
 - Requests are handled one at a time (FIFO). The actor can cancel a pending
   request.
-- If no witness is connected, the actor can still type and submit, but
-  requests wait **[Q6]**. Optional timeout to auto-reject.
+- If no witness is connected, requests wait (D6).
+- **The actor logs out** (exits the shell or closes the session) →
+  everything in the queue is purged, and an audit entry
+  `queue_purged: n requests` is written.
 
-## 5. Authorisation of witnesses **[Q5]**
+### 4.5 Witnessed file edits (proposed)
+Editing in vim under an interactive grant works, but the witness then has
+to follow keystrokes. A cleaner flow for the "file edits" part of D1:
 
-Default: a config file `/etc/witnesshell/policy.toml`.
+```
+actor:   wedit /etc/nginx/nginx.conf        (itself a gated request)
+server:  reads the file as the target user, sends a copy to the actor client
+client:  opens $EDITOR locally on a temp copy (actor's laptop; nothing runs on the host)
+client:  on save+quit, sends the new content
+witness: sees a unified diff  →  approve / reject
+server:  writes atomically as the target user (keeps owner and mode), logs the diff
+```
+For files that need root, use `wedit --sudo`. The daemon writes the file
+as root only after the diff is approved, and logs that root was used.
+**[Q16]**
+
+## 5. Authorisation of witnesses (decided: any local user, D5)
+
+- Anyone who can log in to the host (ssh auth succeeds and the user reaches
+  bootstrap) may witness.
+- The one exception is the actor's own uid.
+- A small config file `/etc/witnesshell/config.toml` holds K, timeouts and
+  grant limits:
 
 ```toml
-[actor.alice]
-witnesses = ["bob", "@ops"]      # users or unix groups
-policy    = "any"
-grant_max = "15m"
-
-[defaults]
-witnesses = ["@witness"]
+approvals_required = 1      # K
+grant_max          = "15m"
+udp_port           = 60001
+detach_timeout     = "30m"  # [Q13]
+record_dir         = "/var/log/witnesshell/casts"
 ```
 
-Optional extra: the actor's session shows a short join code, which a witness
-must also enter. This proves the witness is talking to the actor in real time.
+Known limit: one person with two accounts can witness themselves. The
+host's account management has to prevent that.
 
 ## 6. Transport: QUIC, mosh-style
 
@@ -143,10 +201,11 @@ must also enter. This proves the witness is talking to the actor in real time.
   - stream 1: terminal output (server → client)
   - stream 2: actor input (client → server)
 - **Resilience**:
-  - QUIC handles loss and reordering, and its connection IDs allow NAT
-    rebinding and client IP changes (roaming).
-  - If the connection dies anyway (laptop sleep, idle timeout), the client
-    **reconnects with a resume token**.
+  - QUIC handles loss and reordering. Seamless roaming is **not required**
+    (D8). If the client IP changes, the connection may break.
+  - When the connection breaks (IP change, laptop sleep, idle timeout), the
+    client **reconnects with a resume token** to the same session. This does
+    not need SSH again, as long as the session still exists. **[Q13]**
   - The server keeps a **virtual terminal (VT emulator) per session**. On
     resume, it sends the screen state as it is now, not a replay of
     everything missed, the way mosh works. Control messages carry sequence
@@ -155,8 +214,9 @@ must also enter. This proves the witness is talking to the actor in real time.
     (12s)" without dropping the session.
   - Not in v1: mosh's predictive local echo. It matters less here, since
     the actor's draft is local anyway.
-- The session lives on the server for a configurable time after the actor
-  disconnects (default 24 h, like tmux detach).
+- A *disconnect* (network) is different from a *logout* (explicit exit).
+  After a disconnect, the session lives for `detach_timeout` and the queue
+  is kept. A logout purges the queue (D6). **[Q13]**
 
 ## 7. User interfaces
 
@@ -181,15 +241,41 @@ the PTY.
   vote with uid and timestamp, and the outcome.
 - Each entry carries the hash of the previous entry, making a tamper-evident
   chain.
-- Optional asciicast v2 recording of the terminal output for each session
-  **[Q9]**.
 - Optional syslog/journald copy.
+
+### 8.1 Session recording (decided: asciicast v2, D9)
+
+Existing formats that can be replayed:
+
+| Format | Tooling | Pros | Cons |
+|---|---|---|---|
+| **asciicast v2** (asciinema) | `asciinema play`, asciinema-player (web), `agg` (→ GIF), many converters | JSON-lines, append-friendly, so a crash loses at most the last line; easy to write from Go; supports **input (`i`) and marker (`m`) events**; widest support | Text only (fine for us) |
+| asciicast v3 | asciinema CLI 3.x, recent player | Relative timestamps, an "exit" event | Newer, so fewer tools support it so far |
+| `script --log-timing` + `scriptreplay` (util-linux) | Already on every Linux box | No extra install | Two files (data + timing); no metadata or markers; awkward to annotate |
+| ttyrec | ttyplay, ipbt | Old and simple | Binary format, no metadata, barely maintained |
+| tlog (Red Hat) | `tlog-play`, Cockpit, journald/Elasticsearch | Built for audit, ships logs off the box | Its own JSON schema; heavy and RHEL-centric; it hooks the login shell, which is a duplicate of what we already do |
+
+**Proposal: asciicast v2**, one `.cast` file per session in `record_dir`.
+- The header holds session id, actor, host, terminal size, and the
+  start time.
+- `o` events hold terminal output, which covers full-screen programs too.
+- `m` (marker) events hold each request and its outcome, e.g.
+  `"✔ bob,carol: systemctl restart nginx"`. asciinema-player shows markers
+  as chapters, so a replay can jump from command to command.
+- `r` events hold resizes.
+- Actor keystrokes are **not** recorded as `i` events, because passwords
+  would end up in the file. Approved lines are already in the audit log
+  (hidden input stays masked).
+- The SHA-256 of the cast file at the end of the session is written into
+  the hash-chained audit log, so tampering with a recording can be detected.
+- Replay with `asciinema play file.cast`, or the web player. witnesshell
+  needs no player of its own. Optional later: `witnesshell replay`.
 
 ## 9. Language & dependencies **[Q11]**
 
 **Recommendation: Go.** `CGO_ENABLED=0 go build` gives a single static
-binary for linux/amd64, linux/arm64, darwin and windows (client side) with
-no libc dependency. All the needed libraries are pure Go:
+binary for linux/amd64 and linux/arm64 (D10) with no libc dependency.
+All the needed libraries are pure Go:
 
 | Need | Library |
 |---|---|
@@ -257,37 +343,32 @@ before any networking.
 
 ## Open questions
 
-1. **Threat model.** Is this an *enforcement* control (actor may be
-   untrusted, e.g. a contractor or compliance four-eyes rule), or a
-   *cooperative safety net* against mistakes? This decides whether a root
-   daemon + ForceCommand is needed. *Default: enforcement.*
-2. **Gate granularity.** Gate every input line sent to the PTY (secure,
-   no tab completion), or only shell command lines via shell integration
-   (nicer UX, bypassable)? *Default: every line.*
-3. **Full-screen / interactive programs** (vim, top, less, mysql REPL).
-   Options: time-limited interactive grants watched live, block them
-   entirely, or something else? *Default: grants.*
-4. **Multiple witnesses.** Should 1 approval suffice, all, or K-of-N?
-   Should one reject veto? *Default: any 1, any reject vetoes,
-   configurable.*
-5. **Who may witness whom.** Options: config file of users/groups, a
-   unix group, a join code from the actor, or a combination?
-   *Default: config file + optional join code.*
-6. **No witness present.** Should requests queue until a witness joins,
-   should the session refuse to start, or should there be a timeout?
-   *Default: queue, optional auto-reject timeout.*
-7. **Privileges.** Do actors need `sudo` / root commands? If yes, run
-   sudo inside the session (the password prompt is gated as hidden
-   input), or have witnesshell run the shell as a target user directly?
-8. **Network.** Can you open a UDP port range on the remote hosts? Is it
-   OK that the client binary must be installed locally (like mosh)?
-   Is roaming (IP change mid-session) required in v1?
-9. **Audit.** Are full output recordings (asciicast) required, or only
-   command/approval logs? Should logs go somewhere off-box?
-10. **Platforms.** Remote: Linux only? Which architectures? Client:
-    Linux / macOS / Windows?
-11. **Language.** Is Go OK (recommended), or do you prefer Rust?
-12. **Witness powers.** Beyond approve/reject: chat messages, sending
-    Ctrl-C, killing the session, taking over as actor?
-13. **Session lifetime.** How long does a detached session survive, and
-    what happens to running commands when it expires?
+Q1–Q10 are answered and recorded as D1–D10 in §0.
+
+11. **Language.** Is Go OK (recommended: simplest static builds, mature
+    pure-Go QUIC/PTY libraries), or do you prefer Rust (quinn + musl)?
+12. **Witness powers.** What can a witness do beyond approve/reject?
+    *Default:* chat messages to the actor, send Ctrl-C to the running
+    command, revoke an interactive grant. *Not by default:* kill the
+    session, take over as actor.
+13. **Session lifetime after a disconnect.** How long does the session (and
+    its queue and running commands) survive a broken connection before it
+    counts as a logout and the queue is purged? *Default:* 30 min, then
+    the shell gets SIGHUP like a normal ssh logout.
+    What should a witness's disconnect mean? *Default:* their votes on
+    pending requests are kept; an interactive grant ends if fewer than K
+    witnesses are still watching.
+14. **Role assignment.** When a user logs in while another user's session
+    is active, should they **automatically** become a witness (your original
+    description), or be **asked** "witness alice's session / start your own"?
+    Can there be several actor sessions on the host at the same time?
+    *Default:* ask, and allow several sessions.
+15. **Veto.** With K-of-N, does a single rejection reject the request even if
+    K others approve? *Default:* yes, any rejection vetoes.
+16. **File edits.** Is the "witnessed edit" flow in §4.5 (edit locally →
+    witness approves a diff → server writes) wanted in v1, or are vim/nano
+    under a watched interactive grant enough to start with?
+17. **Interactive grants.** Since witnesses see full-screen output live, is a
+    witness-approved, time-limited grant (revocable at any moment) an
+    acceptable way to use vim/top/less? Or must every keystroke in those
+    programs be approved too (very slow)?
