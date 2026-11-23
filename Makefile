@@ -47,4 +47,13 @@ verify-static: build
 clean:
 	rm -rf $(DIST)
 
+# Disposable test VM for anything that needs root; see scripts/vm.sh.
+# Machine-specific settings (VM_DIR, VM_QEMU_ROOT, ...) may go in local.mk.
+-include local.mk
+export VM_DIR VM_QEMU_ROOT VM_SSH_PORT VM_MEM VM_CPUS VM_USER
+
+.PHONY: vm-start vm-stop vm-status vm-ssh vm-reset
+vm-start vm-stop vm-status vm-ssh vm-reset: vm-%:
+	@sh scripts/vm.sh $*
+
 FORCE:

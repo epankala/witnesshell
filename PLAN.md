@@ -1,13 +1,14 @@
-# witnesshell — design & implementation plan (v0.3)
+# witnesshell — design & implementation plan (v0.4)
 
-> Status: design settled (all questions answered 2026-11-23). Next: M0.
+> Status: M0 and M1 done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; `internal/shell` (bash on a socket) is superseded. Next: M2a.
 
 ## 0. Decisions
 
 | # | Decision |
 |---|---|
 | D1 | Guard against **accidental and malicious** shell commands → enforcement mode |
-| D2 | Enforce on the **PTY input stream**, not via shell hooks (they can be bypassed, §3.1) |
+| D2 | **witnesshell is the shell**, replacing bash; started programs are restricted by the kernel (§4.5) |
 | D3 | Witnesses see a live mirror of the terminal, full-screen programs included |
 | D4 | Approval policy **K-of-N** (configurable K, e.g. 1-of-1) |
 | D5 | Any user with a login on the host can witness, except the actor's own uid |
@@ -23,6 +24,12 @@
 | D15 | **Any rejection vetoes**, even if K approvals exist |
 | D16 | **No file-edit feature.** Users keep config in git and show `git diff`; witnesses refuse to approve use of unreviewed edits. This is a process rule, documented in README |
 | D17 | **Approving a command approves the whole program run.** While an approved command is in the foreground, all input passes freely (watched live and recorded). When it exits and the shell is back in the foreground, gating resumes |
+| D18 | A program or script may run, with witness approval, if the actor **cannot modify it** (§4.4) |
+| D19 | A file the actor owns or can modify may run only if **signed by a witness**; approval is still needed |
+| D20 | Interpreters the actor cannot modify may be started **if witnesses approve** |
+| D21 | `sudo` stays (D7) for now |
+| D22 | Signing happens off the host (signature copied in) or on the host. One witness signature is enough; the actor's own does not count |
+| D23 | Root and sandbox tests run in a **VM** (`make vm-start`), used over ssh |
 
 ## 1. Goal
 
@@ -74,9 +81,9 @@ SSH is used only for login and bootstrap. The session itself runs over
 
 | Requirement | Why |
 |---|---|
-| Session server is a **root daemon**; the shell is forked and drops to the target uid | Same-uid processes could be ptraced or killed by the actor |
+| Session server is a **root daemon**; the shell process drops to the target uid and is non-dumpable | Tested: the actor then cannot open its memory or descriptors in `/proc`. The actor can still kill it, which ends the session |
 | `Match Group witnesshell` → `ForceCommand witnesshell bootstrap`, `AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, no sftp subsystem | Otherwise the actor opens a plain shell or tunnels around the gate |
-| Gate on PTY input, bash takes commands only from a **private socket** (§4.3) | Shell hooks can be undone |
+| The shell never reads commands from the PTY (§4.3) | Type-ahead would run unapproved |
 | Actor uid ≠ witness uid | No self-witnessing |
 | Admin break-glass access (console / separate un-forced admin account) is outside witnesshell and documented | Need a way in if the daemon is broken |
 
@@ -88,7 +95,7 @@ several ways:
 - Run commands from inside a program: `python3` → `os.system()`,
   `vim` → `:!cmd`, `less` → `!cmd`, `awk 'BEGIN{system(...)}'`.
 
-witnesshell therefore controls what reaches the PTY itself.
+witnesshell is therefore the shell (D2).
 
 ### 3.2 Accepted consequences of D17
 Approving an interactive program (`bash`, `python3`, `vim`, `mysql`,
@@ -99,10 +106,9 @@ The README will spell this out.
 
 ## 4. Gating model
 
-The daemon asks the kernel whether bash is waiting for its next command
-(§4.3), which the actor cannot fake by printing. It gives two states:
+witnesshell starts every command, so it knows when one ends. Two states:
 
-### 4.1 PROMPT state: bash is waiting for a command
+### 4.1 PROMPT state: no foreground job
 - The actor's keystrokes go into a **draft buffer** in the daemon, never
   to the PTY.
 - The draft is shown in the actor's bottom bar (`draft> …`), and witnesses
@@ -117,9 +123,9 @@ The daemon asks the kernel whether bash is waiting for its next command
 
 ### 4.2 Request lifecycle
 ```
-draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ line written to command socket (§4.3)
+draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ executed by witnesshell (§4.3)
                    │                                               (state becomes RUNNING
-                   ├──any reject + comment──▶ REJECTED              until bash is idle)
+                   ├──any reject + comment──▶ REJECTED              until the job ends or stops)
                    ├──actor cancels──▶ CANCELLED
                    └──actor logout / 30 min detach──▶ PURGED
 ```
@@ -143,47 +149,77 @@ draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVE
   the PTY**. This covers `y/N` prompts, `sudo` password prompts, vim, top,
   less, REPLs and nested shells.
 - Witnesses watch the live output, which is also recorded.
-- **Transition back to PROMPT** happens when bash waits for its next command:
-  the program exited, or was suspended with Ctrl-Z. `fg` / `bg` are normal
+- **Transition back to PROMPT** happens when the foreground job exits or is
+  suspended with Ctrl-Z; witnesshell then takes back the terminal. `fg` / `bg` are normal
   commands that need approval.
 - The session must serialize "is input free? → write to PTY" against
   "finished" and the next command, or a late key could slip through.
 
-**Command channel** (`internal/shell`, chosen by prototype 2026-11-23):
-- bash runs as `bash --noediting -i`. Its stdin is a **private socket**;
-  stdout, stderr and the controlling terminal are the PTY.
-- Each approved text is sent as `\builtin eval '<text>' </dev/tty`: one unit,
-  with the terminal as its stdin. Children therefore do not get the socket,
-  and incomplete syntax is an error instead of swallowing the next command.
-- Idle = socket empty and `/proc/PID/syscall` shows bash blocked in `read`
-  on that socket. Programs cannot fake this by printing.
-- The PTY input queue is flushed just before each command. This is required:
-  without it leftover typing feeds the next command. It does not race,
-  because no keys are passed while idle.
+- The PTY input queue is flushed before each command, so leftover typing
+  cannot feed it (tested; it does not race, as no keys pass while idle).
 
-Rejected alternatives, each shown to fail:
+**Language.** A small strict language, not a bash clone: simple commands,
+pipelines, `&&` `||` `;` `&`, redirections, quotes, variables, globs, `cd`,
+`export`, `jobs`/`fg`/`bg`/`kill`, `umask`. Anything else is refused with an
+error, never approximated. `exec` is refused. Parser: `mvdan.cc/sh/v3/syntax`.
+Its interpreter is not used: 35 of 45 sample scripts matched bash, and `kill`,
+`umask` and working `fg` are missing.
 
-| Design | Failure |
-|---|---|
-| Interactive bash on the PTY + flush on exit | Type-ahead runs unapproved (5/5) |
-| Script from a pipe, `bash -m` (also `-i`, or with `trap : INT`) | Programs inject commands by reopening the pipe in `/proc`; Ctrl-C in loops kills bash |
-| Interactive bash with readline on the socket | Waits in `pselect`, so idle detection sees nothing |
+**What witnesses approve.** Besides the text: resolved program path, expanded
+arguments, owner, and trusted/signed status. Exactly that is executed. Words
+that cannot be known beforehand (such as command substitution) are refused.
 
-Requirements and open points:
-- bash only in v1. The daemon needs `CAP_SYS_PTRACE` to read `/proc/PID/syscall`.
-- A program that may ptrace bash can control it. Hosts need
-  `kernel.yama.ptrace_scope` ≥ 1; the daemon should refuse to start otherwise.
-- Not yet tested: `sudo` with a password, running as root with a uid switch,
-  login profile files, arm64 hardware.
+### 4.4 What may run (D18–D20, D22)
+A file is **trusted** if it, and every directory on its resolved path, is not
+owned by the actor and not writable by the actor (mode, group, ACL). Otherwise
+it must be **signed**. Loose ends that count as files to check:
+- `#!` interpreters must be trusted.
+- For known interpreters, script arguments (`python3 x.py`, `sh x.sh`), also
+  behind `sudo`, `env`, `nice` and similar.
+- `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PYTHONPATH` etc. are stripped.
 
-### 4.4 Edge cases
-- `cmd &`: bash is idle again, so the next input is gated. The background
-  job's output is still mirrored and recorded.
-- **`exec bash` / `exec python3`** replaces the gated bash and, under D17,
-  leaves input free for the rest of the session. Open: end the session
-  instead (recommended).
-- Shell exits (e.g. the shell itself was killed): the session ends, the
-  queue is purged, and the end is logged.
+**Signed files.** The daemon hashes the file, checks the signature, and copies
+it to a root-owned store `/var/lib/witnesshell/signed/<sha256>`; the copy is
+what runs, so a later edit has no effect. Two ways to sign:
+- *Off the host:* an SSH signature (`ssh-keygen -Y sign -n witnesshell`),
+  checked against root-owned `/etc/witnesshell/allowed_signers`. Never against
+  `~/.ssh`, which users can edit.
+- *On the host:* `witnesshell sign FILE`. The daemon identifies the witness by
+  peer credentials and records the hash, so no private key is on the host.
+
+### 4.5 Kernel restrictions
+Tested in the VM (Ubuntu 26.04, kernel 7.0), as alice started by root.
+"Ran" means the attempt succeeded:
+
+| Attempt | None | Landlock exec only from /usr | noexec mounts | Both |
+|---|---|---|---|---|
+| `./evil`, `./s.sh` | ran | blocked | blocked | blocked |
+| `ld.so ./evil` | ran | **ran** | blocked | blocked |
+| program from memory (memfd) | ran | **ran** | **ran** | **ran** |
+| `python3 s.py` | ran | **ran** | **ran** | **ran** |
+| `sudo ./evil` | ran | blocked | blocked | blocked |
+| `sudo mount` (legitimate) | works | **broken** | works | **broken** |
+| `sudo systemd-run ./evil` | ran | **ran** | **ran** | **ran** |
+| `systemd-run --user ./evil` | ran | **ran** | (*) | (*) |
+| install a crontab | works | works | works | works |
+
+(*) Blocked, but probably only because the test hid the user's bus socket.
+Treat as an escape. memfd was blocked with `vm.memfd_noexec=2` (with both).
+
+Consequences:
+- **Host requirements:** every filesystem the actor can write to is mounted
+  `noexec,nosuid` host-wide (so cron and user services are covered too);
+  `vm.memfd_noexec=2`; cron/at and user services denied to actors. The daemon
+  checks these and refuses to start otherwise (`allow_weak_host` overrides).
+- **Landlock** exec rules apply to commands not run through `sudo`, because
+  they break `sudo mount`. `sudo` needs root's power; witnesses decide.
+- seccomp: still to be designed. `no_new_privs` cannot be set (breaks sudo).
+
+**Not enforceable:** an approved interpreter or scriptable program (python,
+vim, awk) can run any logic typed or read inside it, including an unsigned
+script and machine code it builds in its own memory (Python could allocate
+writable+executable memory under every variant). Approving one trusts the
+actor with it (D17). Approved root (`sudo`) can undo everything.
 
 ## 5. Authorisation & config (D5, D13, D14)
 
@@ -196,7 +232,7 @@ max_sessions       = 0        # 0 = unlimited, 1 = single session on host
 detach_timeout     = "30m"    # actor gone this long → logout, queue purged, SIGHUP
 udp_port           = 60001
 record_dir         = "/var/log/witnesshell"
-shell              = "/bin/bash"  # bash only in v1
+allow_weak_host    = false    # skip the host checks of §4.5
 ```
 
 Known limit: one person with two accounts can witness themselves. Account
@@ -299,7 +335,10 @@ internal/proto/         CBOR message types, protocol version
 internal/transport/     QUIC server/client, cert pinning, resume tokens
 internal/bootstrap/     ssh exec, role menu, handshake line
 internal/daemon/        unix socket API, SO_PEERCRED, session registry, max_sessions
-internal/shell/         bash on a PTY, command socket, idle detection
+internal/shell/         (superseded: bash on a socket; PTY code to be reused)
+internal/lang/          parse, refuse, expand into an exact execution plan
+internal/trust/         file trust rules, signatures, signed store
+internal/launch/        root launcher, Landlock, uid switch, job control
 internal/session/       joins gate + shell, VT emulator
 internal/gate/          draft editor, request state machine, votes, K-of-N, veto
 internal/audit/         hash-chained log, asciicast writer
@@ -314,7 +353,9 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 |---|---|---|
 | M0 | Skeleton | Go module, Makefile, static build verified, `go vet` / tests in a `make check` |
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
-| M2 | Local session | daemon + PTY as uid + command socket (§4.3) + PROMPT/RUNNING switching; type-ahead bypass regression test; actor and witness over the **unix socket** on one host (no network yet) |
+| M2a | Trust & launcher | trust rules, signed store, uid switch, Landlock, host checks; every attack in §4.5 is a VM regression test (`make vm-test`) |
+| M2b | Shell language | strict parser, expansion to exact plan, job control, Ctrl-C/Z; attack tests ported from `internal/shell`, which is then removed |
+| M2c | Local session | gate + shell + daemon; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
@@ -325,8 +366,8 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 
 - No tab completion at the prompt.
 - Approving an interactive program grants free input inside it (D17, §3.2).
-- Approval covers the text of a command, not what scripts it runs do.
-  Partly covered by the D16 git-diff convention.
+- Approval covers what is started, not what an approved interpreter or
+  scriptable program then does (§4.5).
 - One person with two accounts can witness themselves (§5).
 - UDP must be reachable on the host (D8). There is no TCP fallback in v1.
 - The root daemon is security-critical: keep it small, fuzz input, and
