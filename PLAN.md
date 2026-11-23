@@ -1,33 +1,39 @@
-# witnesshell — design & implementation plan (DRAFT v0.2)
+# witnesshell — design & implementation plan (v0.3)
 
-> Status: draft. Items marked **[Q#]** depend on open questions (see end).
-> Each has a recommended default so the plan is complete as written.
+> Status: design settled (all questions answered 2026-11-23). Next: M0.
 
-## 0. Decisions so far (2026-11-23)
+## 0. Decisions
 
 | # | Decision |
 |---|---|
-| D1 | Guard against **accidental and malicious** commands *and file edits* → enforcement mode |
-| D2 | Shell commands must be enforced, not just "assisted" → gate on the PTY input stream (§4) |
-| D3 | Witnesses see full-screen program output (live mirror of the terminal) |
-| D4 | Approval policy is **K-of-N** (e.g. 1-of-1, 2-of-3) |
-| D5 | Any user with a login on the remote host can witness (except the actor's own uid) |
-| D6 | Requests wait in a queue. Actor logs out → queue is purged |
+| D1 | Guard against **accidental and malicious** shell commands → enforcement mode |
+| D2 | Enforce on the **PTY input stream**, not via shell hooks (they can be bypassed, §3.1) |
+| D3 | Witnesses see a live mirror of the terminal, full-screen programs included |
+| D4 | Approval policy **K-of-N** (configurable K, e.g. 1-of-1) |
+| D5 | Any user with a login on the host can witness, except the actor's own uid |
+| D6 | Requests wait in a queue; actor logout → queue purged |
 | D7 | Shell runs as the target (login) user; `sudo` is used inside the session for root |
-| D8 | UDP can be opened on the remote host. The client is installed locally. The remote IP is fixed; the client IP may change; a broken connection on an IP change is acceptable |
-| D9 | Recording: **asciicast v2** (asciinema format), plus markers for approved commands (§8) |
-| D10 | Remote: Linux only. Clients: Linux only |
+| D8 | Remote IP is fixed; client IP may change; a broken connection on an IP change is OK; client installed locally |
+| D9 | Recording: **asciicast v2** with markers per request (§8.1) |
+| D10 | Linux only, both ends |
+| D11 | Language: **Go**, static binary (`CGO_ENABLED=0`) |
+| D12 | Witness powers: **approve** or **reject with a comment**. The actor then submits a new command. Nothing else (no typing, no Ctrl-C, no kill) |
+| D13 | Actor disconnected **30 min** → treated as logout. A witness disconnecting does **not** remove votes already given |
+| D14 | On login with sessions active: **ask** "witness one of them / start own session". Several sessions allowed; `max_sessions = 1` can enforce a single session |
+| D15 | **Any rejection vetoes**, even if K approvals exist |
+| D16 | **No file-edit feature.** Users keep config in git and show `git diff`; witnesses refuse to approve use of unreviewed edits. This is a process rule, documented in README |
+| D17 | **Approving a command approves the whole program run.** While an approved command is in the foreground, all input passes freely (watched live and recorded). When it exits and the shell is back in the foreground, gating resumes |
 
 ## 1. Goal
 
 A "four-eyes" remote shell. One person (the **actor**) runs commands on a
-remote machine. One or more other people (**witnesses**) watch the session
-live and must **approve** each piece of input before it reaches the shell.
-Everything is logged.
+remote Linux host. One or more other people (**witnesses**) watch live, and
+K of them must approve each command line before it reaches the shell. Any
+witness can veto a command by rejecting it with a comment. Everything is
+logged and recorded so it can be replayed.
 
-Transport: bootstrap over SSH (for authentication), then switch to **QUIC
-over UDP** with mosh-style resilience (survives packet loss, roaming, and
-sleep/resume).
+SSH is used only for login and bootstrap. The session itself runs over
+**QUIC/UDP**, mosh-style.
 
 ## 2. Roles & user flow
 
@@ -35,340 +41,265 @@ sleep/resume).
  actor laptop                      remote host                     witness laptop
  ────────────                      ───────────                     ──────────────
  witnesshell connect alice@host
-   └─ ssh alice@host witnesshell bootstrap --actor
+   └─ ssh alice@host  (ForceCommand → witnesshell bootstrap)
                                    witnesshelld (daemon, root)
-                                     ├─ verifies peer uid = alice (SO_PEERCRED)
-                                     ├─ creates session S1, PTY shell as alice
-                                     └─ returns  port, cert-hash, token, S1
+                                     ├─ peer uid = alice (SO_PEERCRED)
+                                     ├─ no sessions → create S1, PTY shell as alice
+                                     └─ → port, cert-hash, token, S1
    ssh exits; QUIC ──────────────▶ UDP :60001  ◀────────────── QUIC
-                                                     ssh bob@host witnesshell bootstrap --witness S1
-                                     ├─ verifies peer uid = bob, bob may witness alice
-                                     └─ returns port, cert-hash, token
-                                                   witnesshell witness bob@host [S1]
+                                                     witnesshell connect bob@host
+                                                       └─ ssh bob@host → bootstrap
+                                     ├─ peer uid = bob, sessions exist → ask:
+                                     │    [1] witness alice's session S1
+                                     │    [n] start own session  (hidden if max_sessions reached)
+                                     └─ → port, cert-hash, token, S1, role
 ```
 
-1. The actor runs `witnesshell connect user@host` locally. This calls the system
-   `ssh` binary, so `~/.ssh/config`, agents, jump hosts and keys all work as usual.
-2. On the remote side, `witnesshell bootstrap` asks the local daemon for a session
-   over a unix socket. The daemon identifies the caller by kernel peer
-   credentials. The shell runs **as the actor's login user**, which covers
-   "start with the credentials the login was done with".
-3. The bootstrap prints one line,
-   `WITNESSHELL 1 <udp-port> <cert-sha256> <one-time-token> <session-id>`,
-   then exits, and the SSH connection closes, just like mosh.
-4. The client connects with QUIC. It pins the server's certificate by hash, so
-   no PKI is needed, and presents the token. Trust in the server is carried
-   over from SSH host-key verification.
-5. Witnesses do the same with `witnesshell witness user@host [session-id]`. If
-   only one session is eligible, the client picks it automatically. Otherwise
-   it shows a list.
+1. Everyone uses the same command, `witnesshell connect user@host`. It runs
+   the system `ssh`, so `~/.ssh/config`, agents and jump hosts all work.
+2. sshd forces `witnesshell bootstrap` (`ForceCommand`) for every
+   member of group `witnesshell`. Bootstrap talks to the daemon over
+   `/run/witnesshell.sock`; the daemon identifies the caller by kernel
+   peer credentials.
+3. Role choice (D14): if there are sessions owned by other users, the user
+   is asked, over the ssh TTY, whether to witness one or start their own.
+   A user's own sessions are listed for **reattach** (as actor). Witnessing
+   your own session is never offered.
+4. Bootstrap prints `WITNESSHELL 1 <port> <cert-sha256> <token> <session> <role>`
+   and exits. The ssh connection closes.
+5. The client connects with QUIC, pins the certificate hash (trust carried
+   over from the SSH host key) and presents the one-time token.
 
-## 3. Threat model (decided: enforcement, D1)
-
-The actor may try to get around the gate on purpose. That forces the
-following:
+## 3. Threat model (D1)
 
 | Requirement | Why |
 |---|---|
-| Session server is a separate **daemon running as root** (or a dedicated user with CAP_SETUID), not a process owned by the actor | Same-uid processes can be ptraced or killed by the actor |
-| Actor accounts get `ForceCommand witnesshell bootstrap --actor` in `sshd_config` (Match Group witnessed) | Otherwise the actor just opens a normal ssh shell |
-| Gate sits on the **PTY input stream**, not inside the shell (no bash hooks) | Shell hooks (DEBUG trap, `bind -x`) can be undone by the actor |
-| Actor uid ≠ witness uid, and the witness must be authorised for that actor | Prevents self-witnessing |
-| No port forwarding, agent forwarding or sftp for actor accounts | Those are side channels around the gate |
+| Session server is a **root daemon**; the shell is forked and drops to the target uid | Same-uid processes could be ptraced or killed by the actor |
+| `Match Group witnesshell` → `ForceCommand witnesshell bootstrap`, `AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, no sftp subsystem | Otherwise the actor opens a plain shell or tunnels around the gate |
+| Gate on PTY input, decided by the **kernel's foreground process group** (§4) | Shell hooks can be undone |
+| Actor uid ≠ witness uid | No self-witnessing |
+| Admin break-glass access (console / separate un-forced admin account) is outside witnesshell and documented | Need a way in if the daemon is broken |
 
-**Why gating only "shell commands" can be bypassed.** Hooking the shell
-(bash `DEBUG` trap, `PROMPT_COMMAND`, `bind -x` on Enter) only sees what
-*that bash* parses. The actor can get around it in several ways:
-- Disable the hook: `trap - DEBUG`, `bind -r`, `unset PROMPT_COMMAND`.
-- Start a shell without the hook: `exec sh`, `bash --norc`, `busybox sh`.
-- Run commands from inside a program the shell only saw as one command:
-  `python3`, then `os.system(...)`; `vim`, then `:!rm …`; `less`, then
-  `!cmd`; `mysql \!`; `gdb shell`; `git` hooks or pagers; `awk 'BEGIN{system(...)}'`.
-- Edit files in vim, nano or `ed`. That is not a shell command at all.
+### 3.1 Why shell hooks are not enough
+A bash `DEBUG` trap, `PROMPT_COMMAND` or `bind -x` can be bypassed in
+several ways:
+- Disable it: `trap - DEBUG`, `bind -r`.
+- Start a shell without it: `exec sh`, `bash --norc`, `busybox sh`.
+- Run commands from inside a program: `python3` → `os.system()`,
+  `vim` → `:!cmd`, `less` → `!cmd`, `awk 'BEGIN{system(...)}'`.
 
-So witnesshell does not trust the shell. Every byte sent to the PTY must be
-approved, whatever program reads it. Shell integration (OSC 133 prompt
-marks) is used only to label things in the UI, never for security.
+witnesshell therefore controls what reaches the PTY itself.
 
-**Role assignment** (follows the original idea: first one in is the actor):
-- All users who may use the host get `ForceCommand witnesshell bootstrap`
-  (`Match Group witnesshell`).
-- Bootstrap logic:
-  - No active session by another user: start a new session; this user is
-    the **actor**.
-  - Otherwise: offer to join an existing session as **witness** (pick one
-    from a list if there are several). **[Q14]**
-- A "break-glass" route for admins (console, or a separate un-forced
-  admin account) stays outside witnesshell and is documented as such.
+### 3.2 Accepted consequences of D17
+Approving an interactive program (`bash`, `python3`, `vim`, `mysql`,
+`sudo -i`) means trusting everything done inside it until it exits. That
+activity is shown live and recorded, but not gated. Witnesses should treat
+"approve `sudo -i`" as "approve an unwitnessed root shell, watched only".
+The README will spell this out.
 
-## 4. Gating model **[Q2][Q3]**
+## 4. Gating model
 
-The core idea: **no byte reaches the PTY unless it was approved**, except a
-small allow-list.
+The daemon checks `tcgetpgrp()` on the PTY master. This is kernel state,
+which the actor cannot fake by printing escape codes. It gives two states:
 
-### 4.1 Line mode (default state)
-- The actor's keystrokes go into a **draft buffer held by witnesshell**,
-  not into the shell.
-- The draft is shown in a bottom bar on the actor's screen
-  (`draft> rm -rf /var/tmp/x`). Witnesses see it update live as it is typed.
-- Basic line editing works: ←/→, backspace, Ctrl-A/E/U/W, history of
-  *approved* lines (↑/↓), and paste.
-- **Enter** submits the draft as a *request*. A multi-line paste becomes one
-  request.
-- Once the request is approved, the bytes plus `\r` are written to the PTY.
-- Tab completion is not available, because the shell never sees a partial
-  line. Possible later addition: a server-side filename completer that only
-  reads the filesystem (no execution).
-- The input state of the PTY is checked through termios. If ECHO is off (a
-  password prompt, e.g. `sudo`), the witness sees `«hidden input, 14 chars»`.
-  Approval is **still required**, because `stty -echo` could otherwise be
-  used to switch the gate off.
+### 4.1 PROMPT state: the shell is the foreground process group
+- The actor's keystrokes go into a **draft buffer** in the daemon, never
+  to the PTY.
+- The draft is shown in the actor's bottom bar (`draft> …`), and witnesses
+  see it update live.
+- Editing keys: ←/→, Home/End, Backspace/Delete, Ctrl-A/E/U/W/K, and ↑/↓
+  for history of *approved* lines. A multi-line paste becomes one request.
+- **Enter** submits the draft as a request. After that the draft is locked,
+  and the actor can only cancel it (Esc / Ctrl-C).
+- No tab completion: the shell never sees a partial line.
+- Ctrl-D on an empty draft logs out (it is sent as `exit`; logout does not
+  need approval). Logout purges the queue (D6).
 
-### 4.2 Allow-list (passes immediately, configurable)
-`Ctrl-C` (SIGINT), `Ctrl-\`, and window resize. `Ctrl-Z` and `Ctrl-D` are
-gated by default: Ctrl-D can confirm prompts, and Ctrl-Z leads to job control.
-
-### 4.3 Interactive grants (vim, top, less, REPLs…) **[Q3]**
-- Line mode works for programs that read lines, such as `y/N` prompts, but
-  not for full-screen apps.
-- The actor can ask for an **interactive grant**: "raw keystrokes for up to
-  N minutes".
-- Once a witness approves, keystrokes stream live. Witnesses watch, and any
-  of them can **revoke** instantly with a hotkey.
-- The grant also ends when its time runs out, when the foreground process
-  group changes back to the shell, or when a witness disconnects.
-- Side effect: a full-screen app (the alternate screen is active) gets no
-  input until a grant is approved. The UI shows a hint about this.
-
-### 4.4 Approval policy (decided: K-of-N, D4)
-- `approvals_required = K` (default 1). Requests wait until K distinct
-  witnesses approve. A witness's uid counts once, even if that witness is
-  logged in twice.
-- Whether **any rejection vetoes** is still open. **[Q15]**
-- A rejection can carry a short reason, which the actor sees.
-- Requests are handled one at a time (FIFO). The actor can cancel a pending
-  request.
-- If no witness is connected, requests wait (D6).
-- **The actor logs out** (exits the shell or closes the session) →
-  everything in the queue is purged, and an audit entry
-  `queue_purged: n requests` is written.
-
-### 4.5 Witnessed file edits (proposed)
-Editing in vim under an interactive grant works, but the witness then has
-to follow keystrokes. A cleaner flow for the "file edits" part of D1:
-
+### 4.2 Request lifecycle
 ```
-actor:   wedit /etc/nginx/nginx.conf        (itself a gated request)
-server:  reads the file as the target user, sends a copy to the actor client
-client:  opens $EDITOR locally on a temp copy (actor's laptop; nothing runs on the host)
-client:  on save+quit, sends the new content
-witness: sees a unified diff  →  approve / reject
-server:  writes atomically as the target user (keeps owner and mode), logs the diff
+draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ "line\r" written to PTY
+                   │                                               (state becomes RUNNING
+                   ├──any reject + comment──▶ REJECTED              when fg pgrp changes)
+                   ├──actor cancels──▶ CANCELLED
+                   └──actor logout / 30 min detach──▶ PURGED
 ```
-For files that need root, use `wedit --sudo`. The daemon writes the file
-as root only after the diff is approved, and logs that root was used.
-**[Q16]**
+- Only one request is pending at a time. While a request is pending, the
+  actor cannot write a new draft; the actor can only cancel. **Rejected**:
+  the actor sees the witness name and comment. The rejected text is put
+  back into the draft so it can be fixed and resubmitted (D12).
+- A comment is **required** when rejecting.
+- Votes are tied to witness **uid**, and are kept if the witness
+  disconnects (D13). Two logins by the same uid count as one vote.
+- K is checked against distinct approving uids. If fewer than K witnesses
+  are connected, the request simply waits.
 
-## 5. Authorisation of witnesses (decided: any local user, D5)
+### 4.3 RUNNING state: an approved command is in the foreground (D17)
+- All actor input (keys, Ctrl-C, Ctrl-Z, mouse, paste) goes **straight to
+  the PTY**. This covers `y/N` prompts, `sudo` password prompts, vim, top,
+  less, REPLs and nested shells.
+- Witnesses watch the live output, which is also recorded.
+- **Transition back to PROMPT** happens when the foreground pgrp is the
+  shell's again: the program exited, or was suspended with Ctrl-Z.
+  - The daemon **flushes the PTY input queue** (`tcflush(TCIFLUSH)` on the
+    slave). Otherwise keys typed during the switch would be read by the
+    shell without approval.
+  - Then gating resumes. `fg` / `bg` are normal commands that need approval.
+- The fg pgrp is checked when input arrives *and* on a 50 ms poll, so the
+  transition is noticed even when the actor is idle.
 
-- Anyone who can log in to the host (ssh auth succeeds and the user reaches
-  bootstrap) may witness.
-- The one exception is the actor's own uid.
-- A small config file `/etc/witnesshell/config.toml` holds K, timeouts and
-  grant limits:
+### 4.4 Edge cases
+- `cmd &`: the shell stays in the foreground, so the next input is gated.
+  The background job's output is still mirrored and recorded.
+- `exec python3`: the session leader becomes python, which owns the
+  foreground. This is treated as PROMPT, since the session leader is in the
+  foreground, so each line typed to python needs approval (stricter, not
+  looser).
+- Shell exits (e.g. the shell itself was killed): the session ends, the
+  queue is purged, and the end is logged.
+
+## 5. Authorisation & config (D5, D13, D14)
+
+Any member of group `witnesshell` who logs in may witness any session they
+do not own. `/etc/witnesshell/config.toml`:
 
 ```toml
-approvals_required = 1      # K
-grant_max          = "15m"
+approvals_required = 1        # K
+max_sessions       = 0        # 0 = unlimited, 1 = single session on host
+detach_timeout     = "30m"    # actor gone this long → logout, queue purged, SIGHUP
 udp_port           = 60001
-detach_timeout     = "30m"  # [Q13]
-record_dir         = "/var/log/witnesshell/casts"
+record_dir         = "/var/log/witnesshell"
+shell              = ""       # empty = user's login shell from passwd
 ```
 
-Known limit: one person with two accounts can witness themselves. The
-host's account management has to prevent that.
+Known limit: one person with two accounts can witness themselves. Account
+management on the host has to prevent that.
 
-## 6. Transport: QUIC, mosh-style
+## 6. Transport: QUIC
 
-- **Library**: quic-go (Go) or quinn (Rust). TLS 1.3 with a self-signed
-  certificate created per daemon start. The client pins it by SHA-256.
-- **Port**: one UDP port per daemon, configurable range (e.g.
-  60001–60100 like mosh) **[Q8]**. All sessions share it and are routed by
-  token or connection ID.
-- **Streams**:
-  - stream 0: control (CBOR messages: hello/auth, draft updates, requests,
-    votes, grants, resize, chat)
-  - stream 1: terminal output (server → client)
-  - stream 2: actor input (client → server)
-- **Resilience**:
-  - QUIC handles loss and reordering. Seamless roaming is **not required**
-    (D8). If the client IP changes, the connection may break.
-  - When the connection breaks (IP change, laptop sleep, idle timeout), the
-    client **reconnects with a resume token** to the same session. This does
-    not need SSH again, as long as the session still exists. **[Q13]**
-  - The server keeps a **virtual terminal (VT emulator) per session**. On
-    resume, it sends the screen state as it is now, not a replay of
-    everything missed, the way mosh works. Control messages carry sequence
-    numbers so none are lost or duplicated.
-  - Keepalive every 3 s. The UI shows "connection lost — reconnecting
-    (12s)" without dropping the session.
-  - Not in v1: mosh's predictive local echo. It matters less here, since
-    the actor's draft is local anyway.
-- A *disconnect* (network) is different from a *logout* (explicit exit).
-  After a disconnect, the session lives for `detach_timeout` and the queue
-  is kept. A logout purges the queue (D6). **[Q13]**
+- **quic-go** with TLS 1.3 and a self-signed ECDSA certificate created when
+  the daemon starts. The client pins its SHA-256 hash, obtained over ssh.
+- One UDP port for all sessions; connections are routed by token.
+- Streams:
+  - control (CBOR messages, both directions: hello, draft updates,
+    request/vote/result, state changes, resize, witness list)
+  - terminal output (server → clients)
+  - actor input (actor → server)
+- Keepalive every 3 s; idle timeout 15 s.
+- **Reconnect** (D8: no seamless roaming needed): when the connection
+  drops, the client retries with its **resume token**, from the new IP if
+  that changed, without ssh. The server keeps a **VT emulator** per
+  session and sends the current screen on resume (as mosh does), then the
+  live stream continues. Control messages have sequence numbers.
+- The actor UI shows `connection lost — reconnecting (0:12)`. After 30 min
+  without the actor the server treats it as logout (D13). Witnesses can
+  reconnect at any time while the session exists.
+- Optional later: if the resume token has expired, the client automatically
+  runs the ssh bootstrap again.
 
 ## 7. User interfaces
 
-**Actor:** the full shell screen, plus a 1-line status/draft bar at the
-bottom, made with a DECSTBM scroll region. The bar shows the connection
-state, the witnesses present, and the pending request with its state
-(`⏳ waiting for bob`, `✔ approved by bob`, `✘ rejected: "wrong host"`).
+**Actor:** the full shell screen, with a status bar on the bottom line (a
+DECSTBM scroll region). The bar shows the connection state, the witnesses
+connected, and either the draft or the request state:
+- `⏳ 0/1 — waiting for witness`
+- `✔ approved by bob`
+- `✘ rejected by bob: "wrong host, use db2"`
+- `▶ running (input free)`
 
-**Witness:** a read-only mirror of the actor's screen. A bottom panel shows
-the live draft and the pending request:
-`[a] approve  [r] reject  [v] view full  [g] grant/revoke  [m] message`.
-A bell or highlight fires on each new request. Witnesses can never write to
-the PTY.
+**Witness:** a read-only mirror of the actor's screen plus a 2-line panel
+showing the live draft or pending request:
+- keys: `[a] approve` and `[r] reject`. Reject prompts for a comment, and
+  the comment is required.
+- the panel shows who has approved so far.
+- a bell rings on each new request.
 
-**Both:** a simple chat/message line, to ask "why?" before approving
-**[Q12]**.
+Witness keystrokes never reach the PTY.
 
 ## 8. Audit
 
-- An append-only JSON-lines log in `/var/log/witnesshell/`. Each line holds:
-  session, actor, witnesses present, request text (or hidden marker), each
-  vote with uid and timestamp, and the outcome.
-- Each entry carries the hash of the previous entry, making a tamper-evident
-  chain.
-- Optional syslog/journald copy.
+Each session has an append-only JSON-lines log, `/var/log/witnesshell/<session>.log`.
+It records:
+- session start/end
+- actor
+- each witness join/leave
+- each request: its text, every vote (uid, time, comment) and the outcome
+- RUNNING start/end
+- queue purge.
 
-### 8.1 Session recording (decided: asciicast v2, D9)
+Each entry carries the SHA-256 of the previous one, forming a chain.
+`witnesshell audit verify <file>` checks the chain.
 
-Existing formats that can be replayed:
+### 8.1 Recording: asciicast v2 (D9)
 
-| Format | Tooling | Pros | Cons |
-|---|---|---|---|
-| **asciicast v2** (asciinema) | `asciinema play`, asciinema-player (web), `agg` (→ GIF), many converters | JSON-lines, append-friendly, so a crash loses at most the last line; easy to write from Go; supports **input (`i`) and marker (`m`) events**; widest support | Text only (fine for us) |
-| asciicast v3 | asciinema CLI 3.x, recent player | Relative timestamps, an "exit" event | Newer, so fewer tools support it so far |
-| `script --log-timing` + `scriptreplay` (util-linux) | Already on every Linux box | No extra install | Two files (data + timing); no metadata or markers; awkward to annotate |
-| ttyrec | ttyplay, ipbt | Old and simple | Binary format, no metadata, barely maintained |
-| tlog (Red Hat) | `tlog-play`, Cockpit, journald/Elasticsearch | Built for audit, ships logs off the box | Its own JSON schema; heavy and RHEL-centric; it hooks the login shell, which is a duplicate of what we already do |
+The recording is one `<session>.cast` file next to the log. asciicast v2
+was chosen over v3, `script`/`scriptreplay`, ttyrec and tlog because it has
+the widest replay support (`asciinema play`, the web player, `agg` for
+GIF) and is written one line at a time, so a crash loses at most the
+last line.
 
-**Proposal: asciicast v2**, one `.cast` file per session in `record_dir`.
-- The header holds session id, actor, host, terminal size, and the
-  start time.
-- `o` events hold terminal output, which covers full-screen programs too.
-- `m` (marker) events hold each request and its outcome, e.g.
-  `"✔ bob,carol: systemctl restart nginx"`. asciinema-player shows markers
-  as chapters, so a replay can jump from command to command.
-- `r` events hold resizes.
-- Actor keystrokes are **not** recorded as `i` events, because passwords
-  would end up in the file. Approved lines are already in the audit log
-  (hidden input stays masked).
-- The SHA-256 of the cast file at the end of the session is written into
-  the hash-chained audit log, so tampering with a recording can be detected.
-- Replay with `asciinema play file.cast`, or the web player. witnesshell
-  needs no player of its own. Optional later: `witnesshell replay`.
+Contents:
+- header: session id, actor, host, terminal size, start time
+- `o` events: all terminal output, whatever the state
+- `r` events: resizes
+- `m` markers: `⏳ alice: systemctl restart nginx`,
+  `✔ bob,carol`, `✘ bob: "…"`, `▶ running`, `■ exited`. The web player
+  shows markers as chapters you can jump between.
+- **no `i` (input) events**, so passwords typed in RUNNING state never end
+  up in the file.
 
-## 9. Language & dependencies **[Q11]**
+When the session ends, the cast file's SHA-256 is written into the audit
+chain.
 
-**Recommendation: Go.** `CGO_ENABLED=0 go build` gives a single static
-binary for linux/amd64 and linux/arm64 (D10) with no libc dependency.
-All the needed libraries are pure Go:
+## 9. Dependencies (Go, D11)
 
 | Need | Library |
 |---|---|
 | QUIC + TLS | `github.com/quic-go/quic-go` |
 | PTY | `github.com/creack/pty` |
-| VT emulation (server screen state) | `github.com/charmbracelet/x/vt` or `hinshun/vt10x` |
-| Terminal raw mode / size | `golang.org/x/term` |
-| Peer creds, setuid, termios | `golang.org/x/sys/unix` |
-| Messages | `github.com/fxamacker/cbor/v2` |
+| VT emulation (resume screen state) | `github.com/charmbracelet/x/vt` (fallback `hinshun/vt10x`) |
+| Raw mode / size | `golang.org/x/term` |
+| Peer creds, setuid, tcgetpgrp, tcflush | `golang.org/x/sys/unix` |
+| Wire format | `github.com/fxamacker/cbor/v2` |
 | Config | `github.com/BurntSushi/toml` |
 
-Rust (quinn + rustls + musl target) is a solid second choice. It is stronger
-on memory safety, but cross-compiling static builds is slower and fussier.
-Zig's QUIC ecosystem is too young.
+Build: `CGO_ENABLED=0 GOOS=linux GOARCH={amd64,arm64} go build -trimpath -ldflags='-s -w'`.
 
-## 10. Code layout (Go)
+## 10. Code layout
 
 ```
-cmd/witnesshell/        single binary; subcommands:
-                        connect | witness | bootstrap | daemon | sessions | version
-internal/proto/         CBOR message types, versioning
-internal/transport/     QUIC server/client, cert pinning, resume
-internal/bootstrap/     ssh exec + handshake line parsing
-internal/daemon/        unix socket API, SO_PEERCRED, session registry
-internal/session/       PTY spawn as uid, VT emulator, state machine
-internal/gate/          draft buffer, request queue, votes, grants, allow-list
-internal/policy/        policy.toml loading & evaluation
+cmd/witnesshell/        one binary: connect | bootstrap | daemon | sessions | audit verify | version
+internal/proto/         CBOR message types, protocol version
+internal/transport/     QUIC server/client, cert pinning, resume tokens
+internal/bootstrap/     ssh exec, role menu, handshake line
+internal/daemon/        unix socket API, SO_PEERCRED, session registry, max_sessions
+internal/session/       PTY spawn as uid, fg-pgrp watcher, input flush, VT emulator
+internal/gate/          draft editor, request state machine, votes, K-of-N, veto
 internal/audit/         hash-chained log, asciicast writer
-internal/ui/            actor bar & witness panel rendering
-deploy/                 systemd unit, sshd_config snippet, example policy
-test/e2e/               docker-compose: host + actor + 2 witnesses, netem loss
+internal/ui/            actor status bar, witness panel
+deploy/                 systemd unit, sshd_config snippet, example config.toml
+test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 ```
 
 ## 11. Milestones
 
 | # | Milestone | Done when |
 |---|---|---|
-| M0 | Skeleton | Go module, Makefile, static build check (`file` reports statically linked), CI script |
-| M1 | Gate core, local only | `gate` state machine fully unit-tested; PTY session with a witness over a unix socket on one machine |
-| M2 | Daemon & auth | root daemon, SO_PEERCRED, policy.toml, shell spawned as actor uid, self-witness blocked |
-| M3 | QUIC + SSH bootstrap | `connect` / `witness` work across machines; cert pinning; one-time tokens |
-| M4 | Resilience | VT screen-state resume, roaming, reconnect UI; e2e test with `tc netem` 30 % loss + IP change |
-| M5 | Interactive grants & hidden input | vim/top usable via grant; revoke; ECHO-off masking |
-| M6 | Audit | hash-chained log, asciicast, `witnesshell audit verify` |
-| M7 | Hardening & packaging | systemd unit, sshd ForceCommand docs, fuzzing of proto decoder, release binaries |
+| M0 | Skeleton | Go module, Makefile, static build verified, `go vet` / tests in a `make check` |
+| M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
+| M2 | Local session | daemon + PTY as uid + fg-pgrp PROMPT/RUNNING switching + input flush; actor and witness over the **unix socket** on one host (no network yet) |
+| M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
+| M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
+| M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
+| M6 | Audit & recording | hash-chained log, asciicast with markers, `audit verify`; replay checked with `asciinema play` |
+| M7 | Hardening & release | fuzz proto decoder, privilege-drop review, systemd unit, README (incl. D16 git-diff rule, §3.2 warning), release binaries |
 
-M1 is the heart of the project. It is worth getting the state machine right
-before any networking.
+## 12. Known limitations
 
-## 12. Known limitations / risks
-
-- No tab completion in line mode under enforcement.
-- Approval covers **text**, not meaning. A witness who approves
-  `./deploy.sh` is trusting whatever that script contains. Mitigation: keep
-  a read-only "show file" helper, `[v]` on a path in the witness UI, for
-  later.
-- The actor can still run long-lived or background processes once a line
-  is approved (`nohup …&`). This is by design: you approved it.
-- UDP may be blocked on corporate networks. Possible fallback: QUIC-like
-  framing over the ssh channel itself (later, if needed).
-- A root daemon is a high-value target. Keep it small, fuzz the protocol,
-  and drop privileges right after the PTY fork.
-
----
-
-## Open questions
-
-Q1–Q10 are answered and recorded as D1–D10 in §0.
-
-11. **Language.** Is Go OK (recommended: simplest static builds, mature
-    pure-Go QUIC/PTY libraries), or do you prefer Rust (quinn + musl)?
-12. **Witness powers.** What can a witness do beyond approve/reject?
-    *Default:* chat messages to the actor, send Ctrl-C to the running
-    command, revoke an interactive grant. *Not by default:* kill the
-    session, take over as actor.
-13. **Session lifetime after a disconnect.** How long does the session (and
-    its queue and running commands) survive a broken connection before it
-    counts as a logout and the queue is purged? *Default:* 30 min, then
-    the shell gets SIGHUP like a normal ssh logout.
-    What should a witness's disconnect mean? *Default:* their votes on
-    pending requests are kept; an interactive grant ends if fewer than K
-    witnesses are still watching.
-14. **Role assignment.** When a user logs in while another user's session
-    is active, should they **automatically** become a witness (your original
-    description), or be **asked** "witness alice's session / start your own"?
-    Can there be several actor sessions on the host at the same time?
-    *Default:* ask, and allow several sessions.
-15. **Veto.** With K-of-N, does a single rejection reject the request even if
-    K others approve? *Default:* yes, any rejection vetoes.
-16. **File edits.** Is the "witnessed edit" flow in §4.5 (edit locally →
-    witness approves a diff → server writes) wanted in v1, or are vim/nano
-    under a watched interactive grant enough to start with?
-17. **Interactive grants.** Since witnesses see full-screen output live, is a
-    witness-approved, time-limited grant (revocable at any moment) an
-    acceptable way to use vim/top/less? Or must every keystroke in those
-    programs be approved too (very slow)?
+- No tab completion at the prompt.
+- Approving an interactive program grants free input inside it (D17, §3.2).
+- Approval covers the text of a command, not what scripts it runs do.
+  Partly covered by the D16 git-diff convention.
+- One person with two accounts can witness themselves (§5).
+- UDP must be reachable on the host (D8). There is no TCP fallback in v1.
+- The root daemon is security-critical: keep it small, fuzz input, and
+  drop privileges in the child before exec.
