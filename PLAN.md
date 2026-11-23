@@ -76,7 +76,7 @@ SSH is used only for login and bootstrap. The session itself runs over
 |---|---|
 | Session server is a **root daemon**; the shell is forked and drops to the target uid | Same-uid processes could be ptraced or killed by the actor |
 | `Match Group witnesshell` → `ForceCommand witnesshell bootstrap`, `AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, no sftp subsystem | Otherwise the actor opens a plain shell or tunnels around the gate |
-| Gate on PTY input, decided by the **kernel's foreground process group** (§4) | Shell hooks can be undone |
+| Gate on PTY input, bash takes commands only from a **private socket** (§4.3) | Shell hooks can be undone |
 | Actor uid ≠ witness uid | No self-witnessing |
 | Admin break-glass access (console / separate un-forced admin account) is outside witnesshell and documented | Need a way in if the daemon is broken |
 
@@ -99,10 +99,10 @@ The README will spell this out.
 
 ## 4. Gating model
 
-The daemon checks `tcgetpgrp()` on the PTY master. This is kernel state,
-which the actor cannot fake by printing escape codes. It gives two states:
+The daemon asks the kernel whether bash is waiting for its next command
+(§4.3), which the actor cannot fake by printing. It gives two states:
 
-### 4.1 PROMPT state: the shell is the foreground process group
+### 4.1 PROMPT state: bash is waiting for a command
 - The actor's keystrokes go into a **draft buffer** in the daemon, never
   to the PTY.
 - The draft is shown in the actor's bottom bar (`draft> …`), and witnesses
@@ -117,9 +117,9 @@ which the actor cannot fake by printing escape codes. It gives two states:
 
 ### 4.2 Request lifecycle
 ```
-draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ line written to command pipe (§4.3)
+draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ line written to command socket (§4.3)
                    │                                               (state becomes RUNNING
-                   ├──any reject + comment──▶ REJECTED              when fg pgrp changes)
+                   ├──any reject + comment──▶ REJECTED              until bash is idle)
                    ├──actor cancels──▶ CANCELLED
                    └──actor logout / 30 min detach──▶ PURGED
 ```
@@ -138,34 +138,50 @@ draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVE
 - K is checked against distinct approving uids. If fewer than K witnesses
   are connected, the request simply waits.
 
-### 4.3 RUNNING state: an approved command is in the foreground (D17)
+### 4.3 RUNNING state: an approved command is running (D17)
 - All actor input (keys, Ctrl-C, Ctrl-Z, mouse, paste) goes **straight to
   the PTY**. This covers `y/N` prompts, `sudo` password prompts, vim, top,
   less, REPLs and nested shells.
 - Witnesses watch the live output, which is also recorded.
-- **Transition back to PROMPT** happens when the foreground pgrp is the
-  shell's again: the program exited, or was suspended with Ctrl-Z.
-  - **Type-ahead must not reach the shell.** Tested 2026-11-23: with an
-    ordinary interactive bash, text typed during an approved `sleep 1` ran
-    unapproved in 5/5 tries despite a flush on exit. A flush always races.
-  - Instead bash reads approved commands from a **private pipe**
-    (`bash -m /proc/self/fd/N`), never from the PTY. In the same test the
-    unapproved text ran 0/5 times. Flushing remains only as tidiness.
-  - M2 must settle: keeping the pipe away from child processes, detecting
-    when builtins and pipelines finish, prompt and rc files, non-bash login
-    shells, and nested shells (a suspended or backgrounded one that later
-    reads the PTY).
-  - Then gating resumes. `fg` / `bg` are normal commands that need approval.
-- The fg pgrp is checked when input arrives *and* on a 50 ms poll, so the
-  transition is noticed even when the actor is idle.
+- **Transition back to PROMPT** happens when bash waits for its next command:
+  the program exited, or was suspended with Ctrl-Z. `fg` / `bg` are normal
+  commands that need approval.
+- The session must serialize "is input free? → write to PTY" against
+  "finished" and the next command, or a late key could slip through.
+
+**Command channel** (`internal/shell`, chosen by prototype 2026-11-23):
+- bash runs as `bash --noediting -i`. Its stdin is a **private socket**;
+  stdout, stderr and the controlling terminal are the PTY.
+- Each approved text is sent as `\builtin eval '<text>' </dev/tty`: one unit,
+  with the terminal as its stdin. Children therefore do not get the socket,
+  and incomplete syntax is an error instead of swallowing the next command.
+- Idle = socket empty and `/proc/PID/syscall` shows bash blocked in `read`
+  on that socket. Programs cannot fake this by printing.
+- The PTY input queue is flushed just before each command. This is required:
+  without it leftover typing feeds the next command. It does not race,
+  because no keys are passed while idle.
+
+Rejected alternatives, each shown to fail:
+
+| Design | Failure |
+|---|---|
+| Interactive bash on the PTY + flush on exit | Type-ahead runs unapproved (5/5) |
+| Script from a pipe, `bash -m` (also `-i`, or with `trap : INT`) | Programs inject commands by reopening the pipe in `/proc`; Ctrl-C in loops kills bash |
+| Interactive bash with readline on the socket | Waits in `pselect`, so idle detection sees nothing |
+
+Requirements and open points:
+- bash only in v1. The daemon needs `CAP_SYS_PTRACE` to read `/proc/PID/syscall`.
+- A program that may ptrace bash can control it. Hosts need
+  `kernel.yama.ptrace_scope` ≥ 1; the daemon should refuse to start otherwise.
+- Not yet tested: `sudo` with a password, running as root with a uid switch,
+  login profile files, arm64 hardware.
 
 ### 4.4 Edge cases
-- `cmd &`: the shell stays in the foreground, so the next input is gated.
-  The background job's output is still mirrored and recorded.
-- `exec python3`: the session leader becomes python, which owns the
-  foreground. This is treated as PROMPT, since the session leader is in the
-  foreground, so each line typed to python needs approval (stricter, not
-  looser).
+- `cmd &`: bash is idle again, so the next input is gated. The background
+  job's output is still mirrored and recorded.
+- **`exec bash` / `exec python3`** replaces the gated bash and, under D17,
+  leaves input free for the rest of the session. Open: end the session
+  instead (recommended).
 - Shell exits (e.g. the shell itself was killed): the session ends, the
   queue is purged, and the end is logged.
 
@@ -180,7 +196,7 @@ max_sessions       = 0        # 0 = unlimited, 1 = single session on host
 detach_timeout     = "30m"    # actor gone this long → logout, queue purged, SIGHUP
 udp_port           = 60001
 record_dir         = "/var/log/witnesshell"
-shell              = ""       # empty = user's login shell from passwd
+shell              = "/bin/bash"  # bash only in v1
 ```
 
 Known limit: one person with two accounts can witness themselves. Account
@@ -267,10 +283,9 @@ chain.
 | Need | Library |
 |---|---|
 | QUIC + TLS | `github.com/quic-go/quic-go` |
-| PTY | `github.com/creack/pty` |
 | VT emulation (resume screen state) | `github.com/charmbracelet/x/vt` (fallback `hinshun/vt10x`) |
 | Raw mode / size | `golang.org/x/term` |
-| Peer creds, setuid, tcgetpgrp, tcflush | `golang.org/x/sys/unix` |
+| PTY, peer creds, tcflush | `golang.org/x/sys/unix` |
 | Wire format | `github.com/fxamacker/cbor/v2` |
 | Config | `github.com/BurntSushi/toml` |
 
@@ -284,7 +299,8 @@ internal/proto/         CBOR message types, protocol version
 internal/transport/     QUIC server/client, cert pinning, resume tokens
 internal/bootstrap/     ssh exec, role menu, handshake line
 internal/daemon/        unix socket API, SO_PEERCRED, session registry, max_sessions
-internal/session/       PTY spawn as uid, fg-pgrp watcher, input flush, VT emulator
+internal/shell/         bash on a PTY, command socket, idle detection
+internal/session/       joins gate + shell, VT emulator
 internal/gate/          draft editor, request state machine, votes, K-of-N, veto
 internal/audit/         hash-chained log, asciicast writer
 internal/ui/            actor status bar, witness panel
@@ -298,7 +314,7 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 |---|---|---|
 | M0 | Skeleton | Go module, Makefile, static build verified, `go vet` / tests in a `make check` |
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
-| M2 | Local session | daemon + PTY as uid + command pipe (§4.3) + PROMPT/RUNNING switching; type-ahead bypass regression test; actor and witness over the **unix socket** on one host (no network yet) |
+| M2 | Local session | daemon + PTY as uid + command socket (§4.3) + PROMPT/RUNNING switching; type-ahead bypass regression test; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
