@@ -5,7 +5,8 @@ only after **K-of-N witnesses** approve each command line. Any witness can
 veto a command with a comment. Sessions are bootstrapped over SSH, then run
 over QUIC, and are logged and recorded as asciicast.
 
-Status: **M0 – skeleton**. Nothing functional yet; see [PLAN.md](PLAN.md)
+Status: **M1 – approval logic** (`internal/gate`), not yet connected to a
+shell, so nothing is usable yet; see [PLAN.md](PLAN.md)
 for the design and milestones.
 
 ## Build

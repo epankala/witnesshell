@@ -117,7 +117,7 @@ which the actor cannot fake by printing escape codes. It gives two states:
 
 ### 4.2 Request lifecycle
 ```
-draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ "line\r" written to PTY
+draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVED ──▶ line written to command pipe (§4.3)
                    │                                               (state becomes RUNNING
                    ├──any reject + comment──▶ REJECTED              when fg pgrp changes)
                    ├──actor cancels──▶ CANCELLED
@@ -128,6 +128,11 @@ draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVE
   the actor sees the witness name and comment. The rejected text is put
   back into the draft so it can be fixed and resubmitted (D12).
 - A comment is **required** when rejecting.
+- A veto counts only while the request is pending: the K-th approval starts
+  the command at once. Until then a witness may veto even after approving.
+- Votes name the request ID, so a late keypress cannot approve a newer one.
+- Control, invisible and bidirectional characters (and tabs) are refused, so
+  witnesses are not shown something different from what runs.
 - Votes are tied to witness **uid**, and are kept if the witness
   disconnects (D13). Two logins by the same uid count as one vote.
 - K is checked against distinct approving uids. If fewer than K witnesses
@@ -140,9 +145,16 @@ draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVE
 - Witnesses watch the live output, which is also recorded.
 - **Transition back to PROMPT** happens when the foreground pgrp is the
   shell's again: the program exited, or was suspended with Ctrl-Z.
-  - The daemon **flushes the PTY input queue** (`tcflush(TCIFLUSH)` on the
-    slave). Otherwise keys typed during the switch would be read by the
-    shell without approval.
+  - **Type-ahead must not reach the shell.** Tested 2026-11-23: with an
+    ordinary interactive bash, text typed during an approved `sleep 1` ran
+    unapproved in 5/5 tries despite a flush on exit. A flush always races.
+  - Instead bash reads approved commands from a **private pipe**
+    (`bash -m /proc/self/fd/N`), never from the PTY. In the same test the
+    unapproved text ran 0/5 times. Flushing remains only as tidiness.
+  - M2 must settle: keeping the pipe away from child processes, detecting
+    when builtins and pipelines finish, prompt and rc files, non-bash login
+    shells, and nested shells (a suspended or backgrounded one that later
+    reads the PTY).
   - Then gating resumes. `fg` / `bg` are normal commands that need approval.
 - The fg pgrp is checked when input arrives *and* on a 50 ms poll, so the
   transition is noticed even when the actor is idle.
@@ -286,7 +298,7 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 |---|---|---|
 | M0 | Skeleton | Go module, Makefile, static build verified, `go vet` / tests in a `make check` |
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
-| M2 | Local session | daemon + PTY as uid + fg-pgrp PROMPT/RUNNING switching + input flush; actor and witness over the **unix socket** on one host (no network yet) |
+| M2 | Local session | daemon + PTY as uid + command pipe (§4.3) + PROMPT/RUNNING switching; type-ahead bypass regression test; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
