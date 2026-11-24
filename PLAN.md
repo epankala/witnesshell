@@ -37,6 +37,8 @@
 | D28 | **Separate logs** for the actor and each witness: `witnesshell-<session start>-actor-<name>` and `witnesshell-<same session start>-witness-<name>` (§8) |
 | D29 | A request that starts an interpreter without a checked script file (`python3`, `sh`, `bash -c ...`), also behind `sudo` and similar, shows witnesses the warning **"this allows unsigned code"** |
 | D30 | Initially, users' public keys are root-owned files in `/etc/witnesshell/public_keys/`. The directory **cannot be listed** (0711); the file name follows from the signature |
+| D31 | A witness **never acts with the actor's permissions**. To show a private file, the actor displays it in the session or makes it readable to the witness |
+| D32 | **Everything ends at logout.** Its witnesses are returned to the list of sessions, where they can witness another actor if there is one |
 
 ## 1. Goal
 
@@ -304,7 +306,8 @@ Both start no program. Rules:
   screen; it neither delays others nor is dropped.
 - After reconnecting, the screen is rebuilt from the last 64 KB of output,
   which may be incomplete until M5.
-- Logging out (Ctrl-D or `exit`) needs no approval.
+- Logging out (Ctrl-D or `exit`) needs no approval. Witnesses are returned to
+  the list of sessions (D32); keys typed as the session ended are dropped.
 
 ## 5. Authorisation & config (D5, D13, D14)
 

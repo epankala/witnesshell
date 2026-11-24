@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
@@ -152,32 +153,58 @@ func runAttach(args []string, stdout, stderr io.Writer) int {
 	if !term.IsTerminal(0) || !term.IsTerminal(1) {
 		return fail(stderr, "attach", errors.New("needs a terminal"))
 	}
-	c, err := dial()
-	if err != nil {
-		return fail(stderr, "attach", err)
+	for lobby := false; ; lobby = true {
+		next, err := attachOnce(*start, *id, lobby, stdout)
+		if err != nil {
+			return fail(stderr, "attach", err)
+		}
+		if !next {
+			return ExitOK
+		}
+		*start, *id = false, ""
 	}
-	defer c.Close()
-	r, err := ask(c, wire.Request{Type: wire.List})
-	if err != nil {
-		return fail(stderr, "attach", err)
-	}
-	q, err := choose(r, *start, *id, os.Stdin, stdout)
-	if err != nil {
-		return fail(stderr, "attach", err)
-	}
-	q.Version = wire.Version
-	why, err := ui.Run(c, q, os.Stdin, os.Stdout)
-	if err != nil {
-		return fail(stderr, "attach", err)
-	}
-	if why != "" {
-		fmt.Fprintf(stdout, "witnesshell: %s\n", view.Escape(why))
-	}
-	return ExitOK
 }
 
-// choose asks what to do, unless there is only one possibility (D14).
-func choose(r wire.Reply, start bool, id string, in io.Reader, out io.Writer) (wire.Request, error) {
+// attachOnce joins one session. It reports whether to offer another: a
+// witness whose session ends may go on to a different one (D32).
+func attachOnce(start bool, id string, lobby bool, stdout io.Writer) (bool, error) {
+	if lobby {
+		// Keys meant for the session that just ended must not choose.
+		time.Sleep(time.Second)
+		_ = unix.IoctlSetInt(0, unix.TCFLSH, unix.TCIFLUSH)
+	}
+	c, err := dial()
+	if err != nil {
+		return false, err
+	}
+	defer c.Close()
+	q, err := choose(func() (wire.Reply, error) { return ask(c, wire.Request{Type: wire.List}) }, start, id, lobby, os.Stdin, stdout)
+	if errors.Is(err, errQuit) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	q.Version = wire.Version
+	res, err := ui.Run(c, q, os.Stdin, os.Stdout)
+	if err != nil {
+		if lobby { // for example, the session has ended meanwhile
+			fmt.Fprintf(stdout, "witnesshell: %s\n", err)
+			return true, nil
+		}
+		return false, err
+	}
+	if res.Why != "" {
+		fmt.Fprintf(stdout, "witnesshell: %s\n", view.Escape(res.Why))
+	}
+	return res.Ended && q.Type == wire.Witness, nil
+}
+
+var errQuit = errors.New("quit")
+
+// choose asks what to do, unless there is only one possibility (D14). In the
+// lobby it always asks, until there is an answer.
+func choose(list func() (wire.Reply, error), start bool, id string, lobby bool, in io.Reader, out io.Writer) (wire.Request, error) {
 	newSession := wire.Request{Type: wire.Actor}
 	join := func(s wire.Session) wire.Request {
 		if s.Own {
@@ -185,38 +212,51 @@ func choose(r wire.Reply, start bool, id string, in io.Reader, out io.Writer) (w
 		}
 		return wire.Request{Type: wire.Witness, Session: s.ID}
 	}
-	if start || id == "" && len(r.Sessions) == 0 {
-		return newSession, nil
-	}
-	if id != "" {
-		for _, s := range r.Sessions {
-			if s.ID == id {
-				return join(s), nil
-			}
-		}
-		return newSession, errors.New("no such session")
-	}
-	for i, s := range r.Sessions {
-		what := "witness the session of " + s.Actor
-		if s.Own {
-			what = "return to your session"
-		}
-		fmt.Fprintf(out, "  [%d] %s, started %s\n", i+1, view.Escape(what), view.Escape(s.Since))
-	}
-	if r.CanStart {
-		fmt.Fprintln(out, "  [n] start your own session")
-	}
 	b := bufio.NewReaderSize(in, 16)
-	for range 3 {
-		fmt.Fprint(out, "choose: ")
-		l, err := b.ReadString('\n')
+	for try := 0; lobby || try < 3; try++ {
+		r, err := list()
 		if err != nil {
 			return newSession, err
 		}
-		l = strings.TrimSpace(l)
-		if l == "n" && r.CanStart {
+		if !lobby && (start || id == "" && len(r.Sessions) == 0) {
 			return newSession, nil
 		}
+		if id != "" {
+			for _, s := range r.Sessions {
+				if s.ID == id {
+					return join(s), nil
+				}
+			}
+			return newSession, errors.New("no such session")
+		}
+		others := false
+		for i, s := range r.Sessions {
+			what := "return to your session"
+			if !s.Own {
+				what, others = "witness the session of "+s.Actor, true
+			}
+			fmt.Fprintf(out, "  [%d] %s, started %s\n", i+1, view.Escape(what), view.Escape(s.Since))
+		}
+		if !others {
+			fmt.Fprintln(out, "  there is no session to witness")
+		}
+		if r.CanStart {
+			fmt.Fprintln(out, "  [n] start your own session")
+		}
+		fmt.Fprint(out, "  [r] refresh  [q] quit\nchoose: ")
+		l, err := b.ReadString('\n')
+		if err != nil {
+			return newSession, errQuit
+		}
+		switch l = strings.TrimSpace(l); {
+		case l == "q":
+			return newSession, errQuit
+		case l == "r":
+			try = -1
+		case l == "n" && r.CanStart:
+			return newSession, nil
+		}
+		// The numbers are those of the list that was shown.
 		if n, err := strconv.Atoi(l); err == nil && n >= 1 && n <= len(r.Sessions) {
 			return join(r.Sessions[n-1]), nil
 		}

@@ -79,6 +79,12 @@ afterwards.
 - **While an approved program runs, the actor may type into it freely.**
   Witnesses watch. Approval is required again when it exits or is suspended.
 
+When the actor logs out, everything the session started ends, and its witnesses
+return to the list of sessions to witness another actor, if there is one.
+
+Witnesses never act with the actor's permissions. To let one read a private
+file, the actor shows it in the session or makes it readable.
+
 Actor and witnesses can look at files (`view`) and check signatures
 (`checksig`) **without approval**, with their own file permissions. Neither
 starts another program.

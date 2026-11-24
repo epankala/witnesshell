@@ -254,6 +254,11 @@ func (s *session) end(why string) {
 		return
 	}
 	s.over = true
+	s.mu.Unlock()
+	// Before anyone is told, so that they do not see it in the list. Not while
+	// holding the lock, since the daemon's lock comes first.
+	s.d.forget(s)
+	s.mu.Lock()
 	if r, purged := s.gate.Logout(); purged {
 		s.log.Info("request purged", "id", r.ID)
 	}
@@ -267,7 +272,6 @@ func (s *session) end(why string) {
 	s.clients = nil
 	s.mu.Unlock()
 	s.log.Info("session ended", "why", why)
-	s.d.forget(s)
 	_ = s.leader.in.Close() // lets an idle leader hang up its jobs
 	_ = s.ptm.Close()       // hangs up the foreground job
 	select {

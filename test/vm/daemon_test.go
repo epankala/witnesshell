@@ -294,6 +294,60 @@ func TestDaemonSession(t *testing.T) {
 	}
 }
 
+func TestDaemonWitnessMovesOn(t *testing.T) {
+	harden(t)
+	fixtures(t)
+	startDaemon(t, "allow_weak_host = true\n") // carol is not prepared as an actor
+	a := attach(t, alice)
+	a.wait("ACTOR alice  PROMPT")
+	c := attach(t, carolUser(), "-new")
+	c.wait("ACTOR carol  PROMPT")
+	b := attach(t, bob)
+	b.wait("[2] witness the session of carol")
+	b.typ("1\r")
+	b.wait("WITNESS of alice")
+	a.typ("touch MARK\r")
+	b.wait("[a]pprove")
+	// Keys typed as the session ends must not choose anything.
+	a.typ("\x03")
+	a.wait("cancelled")
+	a.typ("\x03")
+	time.Sleep(300 * time.Millisecond)
+	a.typ("\x04")
+	for range 5 {
+		b.typ("1\r")
+		time.Sleep(100 * time.Millisecond)
+	}
+	b.wait("the actor logged out")
+	b.wait("[1] witness the session of carol")
+	if b.has("witness the session of alice") && strings.Count(b.screen(), "session of alice") > 1 {
+		t.Errorf("ended session offered:\n%s", b.screen())
+	}
+	time.Sleep(700 * time.Millisecond)
+	if b.has("WITNESS of") {
+		t.Errorf("joined by accident:\n%s", b.screen())
+	}
+	b.typ("1\r")
+	b.wait("WITNESS of carol")
+	c.wait("witnesses: bob")
+	c.typ("echo o''k\r")
+	b.approve(`"echo" "ok"`)
+	c.wait("PROMPT")
+	c.typ("\x04")
+	b.wait("there is no session to witness")
+	a = attach(t, alice)
+	a.wait("ACTOR alice  PROMPT")
+	b.typ("r\r")
+	b.wait("[1] witness the session of alice")
+	b.typ("1\r")
+	b.wait("WITNESS of alice")
+	b.typ("q")
+	b.wait("detached")
+	if err := b.cmd.Wait(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestDaemonSpoofing(t *testing.T) {
 	harden(t)
 	fixtures(t)

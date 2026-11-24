@@ -67,17 +67,25 @@ type ui struct {
 	real    map[int]bool // modes set on the user's terminal
 }
 
-// Run joins a session over conn and returns why it ended.
-func Run(conn net.Conn, q wire.Request, in, out *os.File) (string, error) {
+// Result says how Run ended.
+type Result struct {
+	Why   string
+	Ended bool // the daemon ended it, rather than the user leaving
+}
+
+// Run joins a session over conn. Nothing reads from in once it has returned.
+func Run(conn net.Conn, q wire.Request, in, out *os.File) (Result, error) {
 	u := &ui{conn: conn, out: out, actor: q.Type == wire.Actor, modes: map[int]bool{}, real: map[int]bool{}}
 	if err := u.size(out); err != nil {
-		return "", err
+		return Result{}, err
 	}
 	u.newEmulator(80, 24)
 	q.Rows, q.Cols = u.termSize()
 	if err := wire.Write(conn, q); err != nil {
-		return "", err
+		return Result{}, err
 	}
+	done := make(chan struct{})
+	defer close(done)
 	msgs := make(chan wire.Reply)
 	errs := make(chan error, 1)
 	go func() {
@@ -87,7 +95,11 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (string, error) {
 				errs <- err
 				return
 			}
-			msgs <- r
+			select {
+			case msgs <- r:
+			case <-done:
+				return
+			}
 		}
 	}()
 	// The first answer says whether the request was accepted at all.
@@ -95,14 +107,14 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (string, error) {
 	select {
 	case first = <-msgs:
 	case err := <-errs:
-		return "", fmt.Errorf("connection closed: %w", err)
+		return Result{}, fmt.Errorf("connection closed: %w", err)
 	}
 	if first.Type == wire.Error {
-		return "", errors.New(escapeLines(first.Text))
+		return Result{}, errors.New(escapeLines(first.Text))
 	}
 	old, err := term.MakeRaw(int(in.Fd()))
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	fmt.Fprint(out, "\x1b[?1049h\x1b[2J")
 	defer func() {
@@ -110,23 +122,16 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (string, error) {
 		fmt.Fprint(out, "\x1b[0m\x1b[?25h\x1b[?1049l")
 		_ = term.Restore(int(in.Fd()), old)
 	}()
-	keys := make(chan []byte)
-	go func() {
-		b := make([]byte, 4096)
-		for {
-			n, err := in.Read(b)
-			if err != nil || n == 0 {
-				close(keys)
-				return
-			}
-			keys <- append([]byte(nil), b[:n]...)
-		}
-	}()
+	keys, stopKeys, err := readKeys(in)
+	if err != nil {
+		return Result{}, err
+	}
+	defer stopKeys()
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, unix.SIGWINCH)
 	defer signal.Stop(winch)
 	if why, over := u.receive(first); over {
-		return why, nil
+		return Result{why, true}, nil
 	}
 	tick := time.NewTicker(30 * time.Millisecond)
 	defer tick.Stop()
@@ -135,25 +140,25 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (string, error) {
 		select {
 		case r := <-msgs:
 			if why, over := u.receive(r); over {
-				return why, nil
+				return Result{why, true}, nil
 			}
 			dirty = true
 		case err := <-errs:
 			if errors.Is(err, io.EOF) {
-				return "the connection was closed", nil
+				return Result{Why: "the connection was closed"}, nil
 			}
-			return "", err
+			return Result{}, err
 		case k, ok := <-keys:
 			if !ok {
-				return "", nil
+				return Result{}, nil
 			}
 			if u.key(k) {
-				return "detached", nil
+				return Result{Why: "detached"}, nil
 			}
 			dirty = true
 		case <-winch:
 			if err := u.size(out); err != nil {
-				return "", err
+				return Result{}, err
 			}
 			u.prev = nil
 			fmt.Fprint(out, "\x1b[2J")
@@ -169,6 +174,49 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (string, error) {
 			}
 		}
 	}
+}
+
+// readKeys delivers what is typed until stop is called, which waits until
+// nothing reads from in any more and drops what was typed but not read.
+func readKeys(in *os.File) (keys <-chan []byte, stop func(), err error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	fd, rfd := int(in.Fd()), int(r.Fd())
+	ch, done, gone := make(chan []byte), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(gone)
+		b := make([]byte, 4096)
+		for {
+			p := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}, {Fd: int32(rfd), Events: unix.POLLIN}}
+			if _, err := unix.Poll(p, -1); err == unix.EINTR {
+				continue
+			} else if err != nil || p[1].Revents != 0 {
+				return
+			}
+			n, err := unix.Read(fd, b)
+			if err == unix.EINTR {
+				continue
+			}
+			if err != nil || n <= 0 {
+				close(ch)
+				return
+			}
+			select {
+			case ch <- append([]byte(nil), b[:n]...):
+			case <-done:
+				return
+			}
+		}
+	}()
+	return ch, func() {
+		close(done)
+		_ = w.Close() // wakes the poll
+		<-gone
+		_ = r.Close()
+		_ = unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)
+	}, nil
 }
 
 func escapeLines(s string) string {
