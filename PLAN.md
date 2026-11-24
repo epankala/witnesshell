@@ -31,6 +31,8 @@
 | D22 | Signing happens off the host (signature copied in) or on the host. One witness signature is enough; the actor's own does not count |
 | D23 | Root and sandbox tests run in a **VM** (`make vm-start`), used over ssh |
 | D24 | Command substitution (`$(...)` and backticks) at the prompt is **refused** for now; two-step approval (inner command, then the completed line) is a later option. Scripts run by an approved interpreter may use it |
+| D25 | A signed file still needs witness approval **every time** it runs |
+| D26 | Host requirements (§4.5: `noexec,nosuid` on user-writable filesystems, `vm.memfd_noexec=2`, no cron or user services for actors) are **required by default**; the config setting `allow_weak_host` skips the checks |
 
 ## 1. Goal
 
