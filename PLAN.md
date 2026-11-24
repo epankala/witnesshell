@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0, M1 and M2 (a, b, c) done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M3.
+> Status: M0 to M3 done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M4.
 
 ## 0. Decisions
 
@@ -85,6 +85,27 @@ SSH is used only for login and bootstrap. The session itself runs over
    and exits. The ssh connection closes.
 5. The client connects with QUIC, pins the certificate hash (trust carried
    over from the SSH host key) and presents the one-time token.
+
+Until M4, `witnesshell connect` runs `ssh -t` and the whole session goes over
+that connection: steps 4 and 5 come with QUIC.
+
+### 2.1 Forced login (M3)
+- **witnesshell is also the login shell.** sshd runs a forced command through
+  the login shell, and Ubuntu's bash then reads `~/.bashrc`, which the actor can
+  write (tested: it ran despite `ForceCommand`). As a login shell, however
+  started, witnesshell does nothing but the bootstrap. It must not be listed in
+  `/etc/shells`, or users could change it with `chsh`.
+- Commands, scp, sftp and forwarding are refused. Files reach the host through
+  approved commands.
+- Keys are root-owned files in `/etc/ssh/authorized_keys/`.
+- **Other terminals are hidden** from a session's programs by a private
+  `/dev/pts`. Otherwise a program in bob's session could write to bob's
+  terminal in which bob witnesses someone else (tested). Other mounts still
+  reach the host, so `sudo mount` works. The login process is non-dumpable.
+- The daemon checks an actor's login shell and the effective sshd configuration
+  (`sshd -T`) before every session (D26). It evaluates `Match` rules for a login
+  from localhost; rules on other addresses are not seen.
+- Files for an installation are in `deploy/`.
 
 ## 3. Threat model (D1)
 
@@ -250,7 +271,8 @@ Landlock also stops remounting inside a user namespace.
 Consequences:
 - **Host requirements:** every filesystem the actor can write to is mounted
   `noexec,nosuid` host-wide (so cron and user services are covered too);
-  `vm.memfd_noexec=2`; cron/at and user services denied to actors. Besides
+  `vm.memfd_noexec=2`; cron/at and user services denied to actors (`user@.service` and
+  `user-runtime-dir@.service` masked). Besides
   `/home` and `/tmp`, places such as `/run/screen`, `/run/lock`, `/var/crash` and
   `/dev/shm` count; the check scans for them (3 s in the VM). The daemon
   checks these and refuses to start otherwise (`allow_weak_host` overrides).

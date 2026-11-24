@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"witnesshell/internal/launch"
+	"witnesshell/internal/pty"
 	"witnesshell/internal/runner"
 	"witnesshell/internal/sign"
 )
@@ -56,6 +59,10 @@ func Leader() error {
 	dec, enc := json.NewDecoder(in), json.NewEncoder(out)
 	var c leaderConfig
 	if err := dec.Decode(&c); err != nil {
+		return err
+	}
+	// Programs such as tty and mesg expect the user to own the terminal.
+	if err := errors.Join(unix.Fchown(0, int(c.User.UID), -1), unix.Fchmod(0, 0o600)); err != nil {
 		return err
 	}
 	store := &sign.Store{Dir: c.StoreDir, Keys: c.Keys, LookupUID: launch.LookupUID}
@@ -109,27 +116,41 @@ type leader struct {
 	done chan struct{}
 }
 
-func startLeader(c leaderConfig, pts *os.File, cgroup *os.File) (*leader, string, error) {
+// startLeader starts the process and returns the session's terminal.
+func startLeader(c leaderConfig, cgroup *os.File, rows, cols uint16) (*leader, *os.File, string, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	ours, theirs := os.NewFile(uintptr(fds[0]), "tty"), os.NewFile(uintptr(fds[1]), "tty")
+	defer ours.Close()
+	conn, err := net.FileConn(ours)
+	if err != nil {
+		_ = theirs.Close()
+		return nil, nil, "", err
+	}
+	defer conn.Close()
 	inR, inW, err := os.Pipe()
 	if err != nil {
-		return nil, "", err
+		_ = theirs.Close()
+		return nil, nil, "", err
 	}
 	outR, outW, err := os.Pipe()
 	if err != nil {
-		_, _ = inR.Close(), inW.Close()
-		return nil, "", err
+		_, _, _ = inR.Close(), inW.Close(), theirs.Close()
+		return nil, nil, "", err
 	}
-	cmd := exec.Command("/proc/self/exe", LeaderArg)
+	cmd := exec.Command("/proc/self/exe", TerminalArg)
 	cmd.Env = []string{}
 	cmd.Dir = "/"
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = pts, pts, pts
-	cmd.ExtraFiles = []*os.File{inR, outW}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, UseCgroupFD: true, CgroupFD: int(cgroup.Fd())}
+	cmd.Stderr = os.Stderr // until there is a terminal
+	cmd.ExtraFiles = []*os.File{inR, outW, theirs}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, UseCgroupFD: true, CgroupFD: int(cgroup.Fd())}
 	err = cmd.Start()
-	_, _ = inR.Close(), outW.Close()
+	_, _, _ = inR.Close(), outW.Close(), theirs.Close()
 	if err != nil {
 		_, _ = inW.Close(), outR.Close()
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	l := &leader{in: inW, enc: json.NewEncoder(inW), dec: json.NewDecoder(outR), cmd: cmd, done: make(chan struct{})}
 	go func() {
@@ -137,15 +158,26 @@ func startLeader(c leaderConfig, pts *os.File, cgroup *os.File) (*leader, string
 		close(l.done)
 	}()
 	var r leaderResp
-	if err = l.enc.Encode(c); err == nil {
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	ptm, err := receiveTerminal(conn.(*net.UnixConn))
+	if err == nil {
+		err = pty.Resize(ptm, rows, cols)
+	}
+	if err == nil {
+		err = l.enc.Encode(c)
+	}
+	if err == nil {
 		err = l.dec.Decode(&r)
 	}
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = inW.Close()
-		return nil, "", fmt.Errorf("session process: %w", err)
+		if ptm != nil {
+			_ = ptm.Close()
+		}
+		return nil, nil, "", fmt.Errorf("session process: %w", err)
 	}
-	return l, r.Dir, nil
+	return l, ptm, r.Dir, nil
 }
 
 // call sends a request and waits for the answer, which for Run comes when the

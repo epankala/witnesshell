@@ -12,9 +12,16 @@ import (
 )
 
 func main() {
+	if cli.LoginShell(os.Args) {
+		os.Exit(cli.Bootstrap(os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == launch.HelperArg {
 		fmt.Fprintln(os.Stderr, "witnesshell:", launch.Helper())
 		os.Exit(126)
+	}
+	if len(os.Args) > 1 && os.Args[1] == daemon.TerminalArg {
+		fmt.Fprintln(os.Stderr, "witnesshell:", daemon.Terminal())
+		os.Exit(1)
 	}
 	if len(os.Args) > 1 && os.Args[1] == daemon.LeaderArg {
 		if err := daemon.Leader(); err != nil {

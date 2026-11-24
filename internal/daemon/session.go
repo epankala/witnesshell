@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"witnesshell/internal/gate"
 	"witnesshell/internal/launch"
 	"witnesshell/internal/pty"
@@ -129,23 +127,9 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 	s.id = s.since.Format("20060102T150405.000Z")
 	s.log = d.log.With("session", s.id, "actor", u.Name)
 	s.rows, s.cols = clampSize(rows, cols)
-	ptm, pts, err := pty.Open(s.rows, s.cols)
-	if err != nil {
-		return nil, err
-	}
-	defer pts.Close()
-	s.ptm = ptm
 	fail := func(err error) (*session, error) {
-		_ = ptm.Close()
 		s.removeCgroup()
 		return nil, err
-	}
-	// Programs such as tty and mesg expect the user to own the terminal.
-	if err := unix.Fchown(int(pts.Fd()), int(u.UID), -1); err != nil {
-		return fail(err)
-	}
-	if err := unix.Fchmod(int(pts.Fd()), 0o600); err != nil {
-		return fail(err)
 	}
 	s.cgroup = cgroupBase + "/" + s.id
 	if err := os.Mkdir(s.cgroup, 0o755); err != nil {
@@ -156,7 +140,7 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 		return fail(err)
 	}
 	defer cg.Close()
-	s.leader, s.dir, err = startLeader(leaderConfig{User: u, StoreDir: d.store.Dir, Keys: d.store.Keys, ExecDirs: d.c.ExecDirs}, pts, cg)
+	s.leader, s.ptm, s.dir, err = startLeader(leaderConfig{User: u, StoreDir: d.store.Dir, Keys: d.store.Keys, ExecDirs: d.c.ExecDirs}, cg, s.rows, s.cols)
 	if err != nil {
 		return fail(err)
 	}

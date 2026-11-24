@@ -104,8 +104,9 @@ start() {
 	# shellcheck disable=SC2086
 	qemu qemu-system-x86_64 $accel "$@"
 	end=$(($(date +%s) + TIMEOUT))
-	# carol is created last, so the accounts exist once carol can log in.
-	until VM_USER=carol vmssh true </dev/null 2>/dev/null; do
+	# carol is created last, so all accounts exist once carol does. The test
+	# users cannot run commands over ssh once the VM is hardened.
+	until VM_USER=vmadmin vmssh 'id carol >/dev/null' </dev/null 2>/dev/null; do
 		running || { echo "VM exited; see $DIR/console.log" >&2; exit 1; }
 		[ "$(date +%s)" -lt "$end" ] || { echo "timed out; see $DIR/console.log" >&2; exit 1; }
 		sleep 3

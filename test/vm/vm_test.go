@@ -112,9 +112,31 @@ for d in /home /tmp /var/tmp /dev/shm /run/lock /var/crash /dev/mqueue /run/scre
 done
 for t in cron at; do rm -f /etc/$t.allow; grep -qsx alice /etc/$t.deny || echo alice >>/etc/$t.deny; done
 ln -sf /dev/null /etc/systemd/system/user@.service
+ln -sf /dev/null /etc/systemd/system/user-runtime-dir@.service
 systemctl daemon-reload
 systemctl stop user@$(id -u alice).service 2>/dev/null || true
+for u in alice bob carol; do umount -l /run/user/$(id -u $u) 2>/dev/null || true; rmdir /run/user/$(id -u $u) 2>/dev/null || true; done
 rm -f /var/lib/systemd/linger/alice`)
+	forceLogin(t)
+}
+
+// forceLogin installs the files in deploy as an administrator would.
+func forceLogin(t *testing.T) {
+	t.Helper()
+	if !exists(binary) {
+		return
+	}
+	sh(t, `getent group witnesshell >/dev/null || groupadd -r witnesshell
+mkdir -p /etc/ssh/authorized_keys
+for u in alice bob carol; do
+  usermod -s /usr/local/bin/witnesshell -aG witnesshell $u
+  [ -f /etc/ssh/authorized_keys/$u ] || cp /home/$u/.ssh/authorized_keys /etc/ssh/authorized_keys/$u
+done
+chown -R root: /etc/ssh/authorized_keys; chmod 755 /etc/ssh/authorized_keys; chmod 644 /etc/ssh/authorized_keys/*
+if ! cmp -s /usr/local/lib/deploy/10-witnesshell.conf /etc/ssh/sshd_config.d/10-witnesshell.conf; then
+  cp /usr/local/lib/deploy/10-witnesshell.conf /etc/ssh/sshd_config.d/10-witnesshell.conf
+  sshd -t && systemctl reload ssh
+fi`)
 }
 
 func fixtures(t *testing.T) {

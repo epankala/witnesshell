@@ -335,6 +335,15 @@ func (d *Daemon) start(u launch.User, q wire.Request) (*session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host check: %w", err)
 	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	login, err := hostcheck.Login(u.Name, self)
+	if err != nil {
+		return nil, fmt.Errorf("host check: %w", err)
+	}
+	weak = append(weak, login...)
 	if len(weak) > 0 && !d.c.AllowWeakHost {
 		d.log.Error("host does not meet the requirements", "user", u.Name, "problems", weak)
 		return nil, errors.New("this host does not meet the requirements:\n  " + strings.Join(weak, "\n  "))

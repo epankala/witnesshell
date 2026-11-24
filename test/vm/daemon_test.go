@@ -43,7 +43,7 @@ func startDaemon(t *testing.T, config string) *bytes.Buffer {
 		if t.Failed() {
 			t.Logf("daemon log:\n%s", log.String())
 		}
-		if out, _ := exec.Command("pgrep", "-f", "__session").Output(); len(out) != 0 {
+		if out, _ := exec.Command("pgrep", "-f", "__session|__terminal").Output(); len(out) != 0 {
 			t.Errorf("session processes left: %s", out)
 		}
 	})
@@ -71,15 +71,26 @@ type window struct {
 
 func attach(t *testing.T, u launch.User, args ...string) *window {
 	t.Helper()
+	cmd := exec.Command(binary, append([]string{"attach"}, args...)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: u.UID, Gid: u.GID, Groups: u.Groups}}
+	return open(t, u, cmd)
+}
+
+// open runs a command in a terminal of its own.
+func open(t *testing.T, u launch.User, cmd *exec.Cmd) *window {
+	t.Helper()
 	ptm, pts, err := pty.Open(30, 110)
 	must(err)
 	w := &window{t: t, name: u.Name, ptm: ptm, em: vt.NewEmulator(110, 30)}
-	w.cmd = exec.Command(binary, append([]string{"attach"}, args...)...)
-	w.cmd.Env = []string{"TERM=xterm-256color", "PATH=/usr/bin"}
-	w.cmd.Dir = "/"
-	w.cmd.Stdin, w.cmd.Stdout, w.cmd.Stderr = pts, pts, pts
+	w.cmd = cmd
+	cmd.Env = []string{"TERM=xterm-256color", "PATH=/usr/bin", "HOME=/root"}
+	cmd.Dir = "/"
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = pts, pts, pts
 	must(unix.Fchown(int(pts.Fd()), int(u.UID), -1))
-	w.cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Credential: &syscall.Credential{Uid: u.UID, Gid: u.GID, Groups: u.Groups}}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setsid, cmd.SysProcAttr.Setctty = true, true
 	must(w.cmd.Start())
 	_ = pts.Close()
 	go func() { _, _ = io.Copy(io.Discard, w.em) }()

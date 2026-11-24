@@ -12,10 +12,9 @@ contractor access, four-eyes rules, and privileged work that must be reviewable
 afterwards.
 
 > [!WARNING]
-> **Under development.** It works on a single host: a daemon, an actor and
-> witnesses in separate terminals. There is no network connection, no forced
-> login and no audit log yet. This page describes the intended whole; parts not
-> built yet are marked *planned*. Do not rely on it for security.
+> **Under development.** Sessions work over SSH. There is no QUIC transport and
+> no audit log yet. This page describes the intended whole; parts not built yet
+> are marked *planned*. Do not rely on it for security.
 
 ## Contents
 
@@ -28,7 +27,8 @@ afterwards.
 [Limits](#what-it-does-not-protect-against) ·
 [Logging](#logging-and-recording) ·
 [Status](#status) ·
-[Trying it](#trying-it) ·
+[Installing](#installing) ·
+[Using it](#using-it) ·
 [Building](#building) ·
 [Testing](#testing)
 
@@ -47,9 +47,9 @@ afterwards.
      │ ◀── output ────────────────────┤──── the same output ──────────▶ │
 ```
 
-1. The actor logs in over SSH and starts a session, which continues over QUIC
-   so that it copes with packet loss and can reconnect. *(planned)*
-2. Witnesses log in with their own accounts and join that session. *(planned)*
+1. The actor logs in over SSH and starts a session. It will continue over QUIC,
+   to cope with packet loss and reconnect by itself. *(QUIC planned)*
+2. Witnesses log in with their own accounts and join that session.
 3. The actor types a line. It is parsed, expanded and checked; **nothing has
    run yet**.
 4. Witnesses see the line, the full program path, the final arguments, the
@@ -168,7 +168,8 @@ the shell starts is restricted in layers:
 | **`vm.memfd_noexec=2`** | Programs run from memory files |
 | **No cron, at or user services** for actors | Running outside the session |
 | **Separate privileges** | The shell is root; programs run as the actor with no capabilities and cannot kill, trace or read the shell |
-| **SSH forced command**, no forwarding *(planned)* | Logging in around witnesshell |
+| **witnesshell as login shell and SSH forced command**, no scp, sftp or forwarding | Logging in around witnesshell; startup files such as `~/.bashrc` |
+| **Private terminals** | Reading or faking the same user's other logins |
 
 Landlock is not applied to commands run through `sudo`, because it breaks tools
 such as `mount`.
@@ -185,7 +186,10 @@ Checked when a session starts. Without them the daemon refuses, unless
 - `kernel.yama.ptrace_scope` ≥ 1 and `vm.memfd_noexec` = 2
 - every place the actor can write to mounted `noexec,nosuid`: `/home`, `/tmp`,
   `/var/tmp`, `/dev/shm`, and others the check finds
-- actors denied cron and at; `user@.service` masked
+- actors denied cron and at; `user@.service` and `user-runtime-dir@.service`
+  masked
+- actors have witnesshell as login shell and forced command, see
+  [Installing](#installing)
 
 ## Restrictions of the shell
 
@@ -252,28 +256,44 @@ secrets included.
 | Trust rules, SSH signatures, `checksig`, `keyname` | ✅ done |
 | Restricted launcher, host checks | ✅ done |
 | Shell language and job control | ✅ done |
-| Daemon, approval screens, `view`, on-host `sign` | ✅ done, one host only |
-| Forced SSH login | 🚧 next |
-| QUIC transport and reconnecting | planned |
+| Daemon, approval screens, `view`, on-host `sign` | ✅ done |
+| Forced SSH login | ✅ done |
+| QUIC transport and reconnecting | 🚧 next |
 | Audit logs and recording | planned |
 | Hardening, packaging, releases | planned |
 
 The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
 audited by a third party.
 
-## Trying it
+## Installing
 
-Use the [test VM](#testing), not a machine you care about. As root:
-
-```sh
-witnesshell daemon        # needs the host requirements, or allow_weak_host
-```
-
-Then, as two different users in two terminals:
+Not on a machine you care about yet. As root, with an account outside the group
+`witnesshell` as a way back in:
 
 ```sh
-witnesshell attach        # the actor starts a session; a witness picks it
+install -m 755 witnesshell /usr/local/bin/
+groupadd -r witnesshell
+install -d -m 755 /etc/ssh/authorized_keys
+# for every user, after putting their key in /etc/ssh/authorized_keys/USER:
+usermod -s /usr/local/bin/witnesshell -aG witnesshell USER
+cp deploy/10-witnesshell.conf /etc/ssh/sshd_config.d/
+sshd -t && systemctl reload ssh          # a mistake locks everyone out
+cp deploy/witnesshell.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now witnesshell
 ```
+
+Do not add witnesshell to `/etc/shells`. Meet the [host
+requirements](#host-requirements) too; a refused session says what is missing.
+
+## Using it
+
+Each user, from their own machine:
+
+```sh
+witnesshell connect alice@host      # or just: ssh alice@host
+```
+
+On the host itself, `witnesshell attach` does the same.
 
 | Actor | Witness |
 |---|---|

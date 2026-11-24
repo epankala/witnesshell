@@ -27,8 +27,8 @@ type command struct {
 }
 
 var commands = map[string]command{
-	"connect":   {summary: "connect to user@host as actor or witness (runs ssh, then QUIC)", milestone: "M3/M4"},
-	"bootstrap": {summary: "remote side of connect; started by sshd ForceCommand", milestone: "M3"},
+	"connect":   {summary: "log in to a host over ssh: connect [ssh options] [user@]host", run: runConnect},
+	"bootstrap": {summary: "remote side of connect; started by sshd ForceCommand", run: runBootstrap},
 	"daemon":    {summary: "run the session daemon (root)", run: runDaemon},
 	"attach":    {summary: "on this host: start, reattach to or witness a session", run: runAttach},
 	"sessions":  {summary: "list active sessions on this host", run: runSessions},

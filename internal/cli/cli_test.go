@@ -70,3 +70,26 @@ func TestStubsReportNotImplemented(t *testing.T) {
 		}
 	}
 }
+
+func TestSSHArgs(t *testing.T) {
+	for in, want := range map[string]string{
+		"alice@h": "ssh -t -a -x -- alice@h", "-p 22 h": "ssh -t -a -x -p 22 -- h",
+		"": "", "-oProxyCommand=x": "", "h -v": "",
+	} {
+		got, err := sshArgs(strings.Fields(in))
+		if strings.Join(got, " ") != want || (err == nil) != (want != "") {
+			t.Errorf("%q: %q %v", in, got, err)
+		}
+	}
+}
+
+func TestLoginShell(t *testing.T) {
+	for in, want := range map[string]bool{
+		"-witnesshell": true, "witnesshell -c x": true, "": true, "-witnesshell daemon": true,
+		"witnesshell": false, "witnesshell daemon": false, "/usr/local/bin/witnesshell version": false,
+	} {
+		if got := LoginShell(strings.Fields(in)); got != want {
+			t.Errorf("%q: %v", in, got)
+		}
+	}
+}

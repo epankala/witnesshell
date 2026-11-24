@@ -59,6 +59,7 @@ vm-test: vm-start $(DIST)/witnesshell-linux-amd64
 	GOOS=linux GOARCH=amd64 $(GO) test -c -tags vmtest -o $(DIST)/vm.test ./test/vm
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/lib/vm.test && chmod 755 /usr/local/lib/vm.test"' <$(DIST)/vm.test
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/bin/witnesshell && chmod 755 /usr/local/bin/witnesshell"' <$(DIST)/witnesshell-linux-amd64
+	@tar -c deploy | VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo rm -rf /usr/local/lib/deploy; sudo tar -x --no-same-owner -C /usr/local/lib'
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'cd / && sudo timeout 900 /usr/local/lib/vm.test -test.v $(VMTEST_ARGS)' </dev/null
 
 .PHONY: vm-start vm-stop vm-status vm-ssh vm-reset
