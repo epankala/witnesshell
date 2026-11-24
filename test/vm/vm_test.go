@@ -103,6 +103,11 @@ func sh(t *testing.T, c string) string {
 // harden sets up what deploy documentation asks of a host.
 func harden(t *testing.T) {
 	t.Helper()
+	t.Cleanup(func() {
+		if n := strings.Count(sh(t, "cat /proc/1/mountinfo"), " /dev/pts "); n != 1 {
+			t.Errorf("%d mounts on the host's /dev/pts", n)
+		}
+	})
 	sh(t, `sysctl -qw vm.memfd_noexec=2 kernel.yama.ptrace_scope=1
 sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true # do not rely on Ubuntu
 for d in /home /tmp /var/tmp /dev/shm /run/lock /var/crash /dev/mqueue /run/screen /run/cloud-init/tmp; do

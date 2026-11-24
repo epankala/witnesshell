@@ -65,6 +65,7 @@ type ui struct {
 	bell    bool
 	prev    []string
 	real    map[int]bool // modes set on the user's terminal
+	early   []wire.Reply // output that came before the size was known
 }
 
 // Result says how Run ended.
@@ -73,8 +74,9 @@ type Result struct {
 	Ended bool // the daemon ended it, rather than the user leaving
 }
 
-// Run joins a session over conn. Nothing reads from in once it has returned.
-func Run(conn net.Conn, q wire.Request, in, out *os.File) (Result, error) {
+// Run joins a session over conn. If q asks for a separate stream of output, it
+// arrives on screen. Nothing reads from in once Run has returned.
+func Run(conn net.Conn, q wire.Request, screen <-chan io.Reader, in, out *os.File) (Result, error) {
 	u := &ui{conn: conn, out: out, actor: q.Type == wire.Actor, modes: map[int]bool{}, real: map[int]bool{}}
 	if err := u.size(out); err != nil {
 		return Result{}, err
@@ -88,11 +90,11 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (Result, error) {
 	defer close(done)
 	msgs := make(chan wire.Reply)
 	errs := make(chan error, 1)
-	go func() {
+	receive := func(from io.Reader, failed func(error)) {
 		for {
 			var r wire.Reply
-			if err := wire.Read(conn, wire.MaxReply, &r); err != nil {
-				errs <- err
+			if err := wire.Read(from, wire.MaxReply, &r); err != nil {
+				failed(err)
 				return
 			}
 			select {
@@ -101,7 +103,17 @@ func Run(conn net.Conn, q wire.Request, in, out *os.File) (Result, error) {
 				return
 			}
 		}
-	}()
+	}
+	go receive(conn, func(err error) { errs <- err })
+	if q.Screen != 0 {
+		go func() {
+			select {
+			case s := <-screen:
+				receive(s, func(error) {}) // conn tells what happened
+			case <-done:
+			}
+		}()
+	}
 	// The first answer says whether the request was accepted at all.
 	var first wire.Reply
 	select {
@@ -281,6 +293,12 @@ func (u *ui) feed(b []byte) {
 func (u *ui) receive(r wire.Reply) (why string, over bool) {
 	switch r.Type {
 	case wire.Output:
+		if u.st.Cols == 0 {
+			if len(u.early) < 1024 {
+				u.early = append(u.early, r)
+			}
+			break
+		}
 		if r.Reset {
 			u.newEmulator(max(1, u.em.Width()), max(1, u.em.Height()))
 		}
@@ -290,8 +308,14 @@ func (u *ui) receive(r wire.Reply) (why string, over bool) {
 			break
 		}
 		u.st = *r.State
+		u.st.Cols, u.st.Rows = max(u.st.Cols, 1), max(u.st.Rows, 1)
 		if int(u.st.Cols) != u.em.Width() || int(u.st.Rows) != u.em.Height() {
 			u.em.Resize(int(u.st.Cols), int(u.st.Rows))
+		}
+		early := u.early
+		u.early = nil
+		for _, o := range early {
+			u.receive(o)
 		}
 		if u.st.ID != u.shownID {
 			u.shownID, u.shownAt = u.st.ID, time.Now()

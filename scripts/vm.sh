@@ -5,6 +5,7 @@ set -eu
 
 DIR=${VM_DIR:-$(cd "$(dirname "$0")/.." && pwd)/.vm}
 PORT=${VM_SSH_PORT:-2222}
+UDP=${VM_UDP_PORT:-60001} # forwarded to the same port in the VM
 MEM=${VM_MEM:-2048}
 CPUS=${VM_CPUS:-2}
 TIMEOUT=${VM_TIMEOUT:-900} # seconds to wait for boot; emulation is slow
@@ -96,7 +97,7 @@ start() {
 		-serial "file:$DIR/console.log" -monitor none \
 		-drive "file=$DIR/disk.qcow2,if=virtio,format=qcow2" \
 		-drive "file.driver=vvfat,file.dir=$DIR/seed,file.label=CIDATA,format=raw,if=virtio,read-only=on" \
-		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22" \
+		-netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$PORT-:22,hostfwd=udp:127.0.0.1:$UDP-:$UDP" \
 		-device virtio-net-pci,netdev=n0,romfile=
 	if [ -n "$QROOT" ]; then
 		set -- -L "$QROOT/usr/share/qemu" -L "$QROOT/usr/share/seabios" "$@"

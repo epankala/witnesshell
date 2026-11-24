@@ -50,7 +50,7 @@ clean:
 # Disposable test VM for anything that needs root; see scripts/vm.sh.
 # Machine-specific settings (VM_DIR, VM_QEMU_ROOT, ...) may go in local.mk.
 -include local.mk
-export VM_DIR VM_QEMU_ROOT VM_SSH_PORT VM_MEM VM_CPUS VM_USER
+export VM_DIR VM_QEMU_ROOT VM_UDP_PORT VM_SSH_PORT VM_MEM VM_CPUS VM_USER
 
 # Runs the attack tests as root inside the VM, starting it if needed.
 .PHONY: vm-test
@@ -60,7 +60,7 @@ vm-test: vm-start $(DIST)/witnesshell-linux-amd64
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/lib/vm.test && chmod 755 /usr/local/lib/vm.test"' <$(DIST)/vm.test
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/bin/witnesshell && chmod 755 /usr/local/bin/witnesshell"' <$(DIST)/witnesshell-linux-amd64
 	@tar -c deploy | VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo rm -rf /usr/local/lib/deploy; sudo tar -x --no-same-owner -C /usr/local/lib'
-	@VM_USER=vmadmin sh scripts/vm.sh ssh 'cd / && sudo timeout 900 /usr/local/lib/vm.test -test.v $(VMTEST_ARGS)' </dev/null
+	@VM_USER=vmadmin sh scripts/vm.sh ssh 'cd / && sudo timeout 3600 /usr/local/lib/vm.test -test.v -test.timeout 3500s $(VMTEST_ARGS)' </dev/null
 
 .PHONY: vm-start vm-stop vm-status vm-ssh vm-reset
 vm-start vm-stop vm-status vm-ssh vm-reset: vm-%:

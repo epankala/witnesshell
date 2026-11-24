@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -26,24 +27,38 @@ const replaySize = 64 << 10
 // client is one connection that has joined a session.
 type client struct {
 	conn    net.Conn
+	screen  bulkConn // carries out; nil if conn does
 	user    launch.User
 	actor   bool
-	out     chan wire.Reply
-	state   chan wire.Reply // the latest state; overtakes output
+	out     chan wire.Reply // bulk: output and viewed files
+	msgs    chan wire.Reply
+	state   chan wire.Reply // the latest state
 	lagging bool            // output was skipped; see output
 }
 
-func newClient(conn *net.UnixConn, u launch.User, actor bool) *client {
-	// A large socket buffer would hold output that state cannot overtake.
-	_ = conn.SetWriteBuffer(16 << 10)
-	return &client{conn: conn, user: u, actor: actor, out: make(chan wire.Reply, 1024), state: make(chan wire.Reply, 1)}
+type bulkConn interface {
+	io.Writer
+	SetWriteDeadline(time.Time) error
+}
+
+func newClient(conn net.Conn, screen bulkConn, u launch.User, actor bool) *client {
+	if c, ok := conn.(*net.UnixConn); ok {
+		// A large socket buffer would hold output that state cannot overtake.
+		_ = c.SetWriteBuffer(16 << 10)
+	}
+	return &client{conn: conn, screen: screen, user: u, actor: actor,
+		out: make(chan wire.Reply, 1024), msgs: make(chan wire.Reply, 256), state: make(chan wire.Reply, 1)}
 }
 
 // send queues a message. A client that cannot keep up is dropped; it can
 // reconnect. Session lock held.
 func (c *client) send(r wire.Reply) {
+	q := c.msgs
+	if r.Type == wire.Output || r.Type == wire.Doc {
+		q = c.out
+	}
 	select {
-	case c.out <- r:
+	case q <- r:
 	default:
 		_ = c.conn.Close()
 	}
@@ -58,13 +73,32 @@ func (c *client) sendState(r wire.Reply) {
 	c.state <- r
 }
 
-// writeLoop sends queued messages until the queue is closed.
+// finish ends the client once what is in msgs was sent. Session lock held.
+func (c *client) finish() {
+	close(c.msgs)
+	close(c.out)
+}
+
+func writeTo(w bulkConn, r wire.Reply) error {
+	_ = w.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	return wire.Write(w, r)
+}
+
+// writeLoop sends queued messages until finish is called. State and messages
+// go before output, or do not wait for it at all if it has its own stream.
 func (c *client) writeLoop() {
 	defer func() {
 		_ = c.conn.Close()
-		for range c.out { // discard
+		for range c.msgs { // discard
+		}
+		for range c.out {
 		}
 	}()
+	out := c.out
+	if c.screen != nil {
+		out = nil
+		go c.screenLoop()
+	}
 	for {
 		var r wire.Reply
 		ok := true
@@ -73,16 +107,38 @@ func (c *client) writeLoop() {
 		default:
 			select {
 			case r = <-c.state:
-			case r, ok = <-c.out:
+			case r, ok = <-c.msgs:
+			default:
+				select {
+				case r = <-c.state:
+				case r, ok = <-c.msgs:
+				case r, ok = <-out:
+					if !ok { // msgs is closed too, and may hold the farewell
+						out, ok = nil, true
+						continue
+					}
+				}
 			}
 		}
-		if !ok {
+		if !ok || writeTo(c.conn, r) != nil {
 			return
 		}
-		_ = c.conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
-		if err := wire.Write(c.conn, r); err != nil {
+	}
+}
+
+func (c *client) screenLoop() {
+	defer func() {
+		for range c.out {
+		}
+	}()
+	for r := range c.out {
+		if writeTo(c.screen, r) != nil {
+			_ = c.conn.Close()
 			return
 		}
+	}
+	if w, ok := c.screen.(io.Closer); ok {
+		_ = w.Close()
 	}
 }
 
@@ -251,7 +307,7 @@ func (s *session) end(why string) {
 	}
 	for _, c := range s.clients {
 		c.send(wire.Reply{Type: wire.End, Text: why})
-		close(c.out)
+		c.finish()
 	}
 	s.clients = nil
 	s.mu.Unlock()
@@ -303,7 +359,7 @@ func (s *session) remove(c *client) bool {
 		return false
 	}
 	s.clients = slices.Delete(s.clients, i, i+1)
-	close(c.out)
+	c.finish()
 	return true
 }
 

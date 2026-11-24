@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 to M3 done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M4.
+> Status: M0 to M4 done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M5.
 
 ## 0. Decisions
 
@@ -86,8 +86,10 @@ SSH is used only for login and bootstrap. The session itself runs over
 5. The client connects with QUIC, pins the certificate hash (trust carried
    over from the SSH host key) and presents the one-time token.
 
-Until M4, `witnesshell connect` runs `ssh -t` and the whole session goes over
-that connection: steps 4 and 5 come with QUIC.
+Since M4 the list of sessions (step 3) is shown by the client, over QUIC. ssh
+only runs `quic 1`, which the bootstrap answers with
+`WITNESSHELL 1 <port> <cert-sha256> <token>`. Plain `ssh` and
+`connect --ssh` still carry a whole session over ssh.
 
 ### 2.1 Forced login (M3)
 - **witnesshell is also the login shell.** sshd runs a forced command through
@@ -99,7 +101,8 @@ that connection: steps 4 and 5 come with QUIC.
   approved commands.
 - Keys are root-owned files in `/etc/ssh/authorized_keys/`.
 - **Other terminals are hidden** from a session's programs by a private
-  `/dev/pts`. Otherwise a program in bob's session could write to bob's
+  `/dev/pts`. (M3 leaked that mount to the host, so that later logins shared
+  it; fixed in M4, and every VM test now checks the host's mounts.) Otherwise a program in bob's session could write to bob's
   terminal in which bob witnesses someone else (tested). Other mounts still
   reach the host, so `sudo mount` works. The login process is non-dumpable.
 - The daemon checks an actor's login shell and the effective sshd configuration
@@ -340,7 +343,7 @@ do not own. `/etc/witnesshell/config.toml`:
 approvals_required = 1        # K
 max_sessions       = 0        # 0 = unlimited, 1 = single session on host
 detach_timeout     = "30m"    # actor gone this long → logout, queue purged, SIGHUP
-udp_port           = 60001    # M4
+udp_port           = 60001    # 0 disables QUIC
 record_dir         = "/var/log/witnesshell"   # M6
 exec_dirs          = ["/usr"]  # where Landlock allows programs
 allow_weak_host    = false    # skip the host checks of §4.5
@@ -353,13 +356,21 @@ management on the host has to prevent that.
 
 - **quic-go** with TLS 1.3 and a self-signed ECDSA certificate created when
   the daemon starts. The client pins its SHA-256 hash, obtained over ssh.
-- One UDP port for all sessions; connections are routed by token.
-- Streams:
-  - control (JSON messages, both directions: hello, draft updates,
-    request/vote/result, state changes, resize, witness list)
-  - terminal output (server → clients)
-  - actor input (actor → server)
-- Keepalive every 3 s; idle timeout 15 s.
+- One UDP port (`udp_port`, 0 disables QUIC) for all users.
+- **Login** (`internal/transport`, `internal/daemon/token.go`): a token works
+  once, within 30 s, for the user who logged in by ssh. It is issued only over
+  the local socket, so not to programs in a session. The client sends it only
+  to the certificate that ssh vouched for. Until then a connection can do
+  nothing, is dropped after 5 s, and at most 256 such may exist.
+- Each session, and each other request, is a stream of its own on the user's
+  connection, carrying the same messages as the local socket. A returned witness
+  (D32) uses the same connection.
+- **Terminal output and viewed files have a separate stream**, so that packets
+  lost there do not delay requests, votes and state.
+- Receive windows are small, since what is in flight cannot be overtaken.
+- Keepalive every 3 s; idle timeout 15 s. No 0-RTT and no session tickets.
+- Until M5, a lost connection ends the client; `connect` again returns to the
+  session.
 - **Reconnect** (D8: no seamless roaming needed): when the connection
   drops, the client retries with its **resume token**, from the new IP if
   that changed, without ssh. The server keeps a **VT emulator** per

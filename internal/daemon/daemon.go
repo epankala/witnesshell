@@ -21,6 +21,7 @@ import (
 	"witnesshell/internal/hostcheck"
 	"witnesshell/internal/launch"
 	"witnesshell/internal/sign"
+	"witnesshell/internal/transport"
 	"witnesshell/internal/trust"
 	"witnesshell/internal/wire"
 )
@@ -41,13 +42,14 @@ type Config struct {
 	MaxSessions       int      `toml:"max_sessions"` // 0 means no limit
 	DetachTimeout     string   `toml:"detach_timeout"`
 	AllowWeakHost     bool     `toml:"allow_weak_host"`
+	UDPPort           int      `toml:"udp_port"` // 0 disables QUIC
 	ExecDirs          []string `toml:"exec_dirs"`
 	detach            time.Duration
 }
 
 // LoadConfig reads a configuration file. A missing file means defaults.
 func LoadConfig(name string) (Config, error) {
-	c := Config{ApprovalsRequired: 1, DetachTimeout: "30m", ExecDirs: []string{"/usr"}}
+	c := Config{ApprovalsRequired: 1, UDPPort: 60001, DetachTimeout: "30m", ExecDirs: []string{"/usr"}}
 	md, err := toml.DecodeFile(name, &c)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return c, err
@@ -60,6 +62,9 @@ func LoadConfig(name string) (Config, error) {
 	}
 	if c.ApprovalsRequired < 1 || c.MaxSessions < 0 {
 		return c, fmt.Errorf("%s: approvals_required must be at least 1 and max_sessions at least 0", name)
+	}
+	if c.UDPPort < 0 || c.UDPPort > 65535 {
+		return c, fmt.Errorf("%s: bad udp_port", name)
 	}
 	for _, d := range c.ExecDirs {
 		if !filepath.IsAbs(d) {
@@ -79,6 +84,8 @@ type Daemon struct {
 	sessions []*session
 	starting int
 	conns    map[uint32]int
+	tokens   tokens
+	quic     *transport.Server // nil if disabled
 	last     time.Time
 }
 
@@ -142,6 +149,33 @@ func (d *Daemon) Serve(l *net.UnixListener) error {
 	}
 }
 
+// ServeQUIC accepts QUIC connections until Close, if they are enabled.
+func (d *Daemon) ServeQUIC() error {
+	if d.c.UDPPort == 0 {
+		return nil
+	}
+	q, err := transport.Listen(d.c.UDPPort)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.quic = q
+	d.mu.Unlock()
+	go func() {
+		err := q.Serve(func(t string) (uint32, error) {
+			uid, err := d.tokens.redeem(t, time.Now())
+			if err != nil {
+				d.log.Warn("QUIC login refused", "err", err)
+			}
+			return uid, err
+		}, d.handleQUIC)
+		if err != nil {
+			d.log.Error("QUIC", "err", err)
+		}
+	}()
+	return nil
+}
+
 // Close ends all sessions.
 func (d *Daemon) Close() {
 	d.mu.Lock()
@@ -149,6 +183,10 @@ func (d *Daemon) Close() {
 	d.mu.Unlock()
 	for _, s := range all {
 		s.end("the daemon is stopping")
+	}
+	if d.quic != nil {
+		time.Sleep(300 * time.Millisecond) // for the farewells
+		d.quic.Close()
 	}
 }
 
@@ -192,16 +230,29 @@ func peer(c *net.UnixConn) (uint32, error) {
 	return 0, errors.New("cannot tell where the connection comes from")
 }
 
+// handle serves a connection to the socket.
 func (d *Daemon) handle(conn *net.UnixConn) {
 	defer conn.Close()
-	fail := func(err error) { _ = wire.Write(conn, wire.Reply{Type: wire.Error, Text: err.Error()}) }
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	uid, err := peer(conn)
 	if err != nil {
 		d.log.Warn("connection refused", "err", err)
-		fail(err)
+		_ = wire.Write(conn, wire.Reply{Type: wire.Error, Text: err.Error()})
 		return
 	}
+	d.serve(conn, uid)
+}
+
+// handleQUIC serves a stream of a user who presented a token.
+func (d *Daemon) handleQUIC(st *transport.Stream, uid uint32) {
+	defer st.Close()
+	d.serve(st, uid)
+}
+
+// serve answers the requests of a known user.
+func (d *Daemon) serve(conn net.Conn, uid uint32) {
+	fail := func(err error) { _ = wire.Write(conn, wire.Reply{Type: wire.Error, Text: err.Error()}) }
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	d.mu.Lock()
 	ok := d.conns[uid] < maxPerUser
 	if ok {
@@ -237,6 +288,19 @@ func (d *Daemon) handle(conn *net.UnixConn) {
 		case wire.List:
 			_ = wire.Write(conn, d.list(u))
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Minute)) // time to choose
+		case wire.Token:
+			// Only from the socket: a token must not breed others.
+			if _, ok := conn.(*net.UnixConn); !ok || d.quic == nil {
+				fail(errors.New("not available"))
+				return
+			}
+			t, err := d.tokens.issue(uid, time.Now())
+			if err != nil {
+				fail(err)
+				return
+			}
+			_ = wire.Write(conn, wire.Reply{Type: wire.OK, Text: fmt.Sprintf("%d %s %s", d.quic.Port, d.quic.Fingerprint, t)})
+			return
 		case wire.Sign:
 			if err := d.sign(u, q.Text); err != nil {
 				fail(err)
@@ -245,20 +309,25 @@ func (d *Daemon) handle(conn *net.UnixConn) {
 			}
 			return
 		case wire.Actor, wire.Witness:
-			_ = conn.SetDeadline(time.Now().Add(time.Minute)) // the host check takes a while
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Minute)) // the host check takes a while
 			s, err := d.find(u, q)
 			if err != nil {
 				fail(err)
 				return
 			}
 			_ = conn.SetDeadline(time.Time{})
-			c := newClient(conn, u, q.Type == wire.Actor)
-			go c.writeLoop()
+			var screen bulkConn
+			if st, ok := conn.(*transport.Stream); ok && q.Screen != 0 {
+				if screen, err = st.Screen(q.Screen); err != nil {
+					return
+				}
+			}
+			c := newClient(conn, screen, u, q.Type == wire.Actor)
 			if err := s.join(c, q.Rows, q.Cols); err != nil {
-				c.out <- wire.Reply{Type: wire.Error, Text: err.Error()}
-				close(c.out)
+				fail(err)
 				return
 			}
+			go c.writeLoop()
 			s.serve(c)
 			s.leave(c)
 			return

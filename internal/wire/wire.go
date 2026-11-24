@@ -30,6 +30,8 @@ type Request struct {
 	ID      uint64 `json:",omitempty"`
 	Approve bool   `json:",omitempty"`
 	Text    string `json:",omitempty"` // comment, path or hash
+	// Screen asks for output on a separate stream with this name, if not 0.
+	Screen uint64 `json:",omitempty"`
 }
 
 // Request types. A connection starts with List, Sign, Actor or Witness.
@@ -43,6 +45,8 @@ const (
 	Vote     = "vote"   // witness
 	View     = "view"   // witness: Text is a path
 	Checksig = "checksig"
+	Token    = "token" // local only: a login for QUIC
+	Auth     = "auth"  // QUIC only, first of all: Text is the token
 )
 
 // Reply is a message from the daemon.
@@ -67,6 +71,7 @@ const (
 	Doc       = "doc"
 	Report    = "report" // of checksig
 	End       = "end"    // the session is over
+	Screen    = "screen" // begins a stream of output; Text is its name
 )
 
 // Session is an entry in the list of sessions.

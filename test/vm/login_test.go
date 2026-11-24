@@ -29,7 +29,13 @@ var sshOpts = []string{"-q", "-i", "/root/tk", "-o", "StrictHostKeyChecking=no",
 
 func connect(t *testing.T, u launch.User) *window {
 	t.Helper()
-	args := append([]string{"connect"}, sshOpts...)
+	return connectWith(t, u, "--ssh")
+}
+
+// connectWith runs connect with options of its own.
+func connectWith(t *testing.T, u launch.User, own ...string) *window {
+	t.Helper()
+	args := append(append([]string{"connect"}, own...), sshOpts...)
 	return open(t, u, exec.Command(binary, append(args, u.Name+"@127.0.0.1")...))
 }
 
@@ -132,7 +138,15 @@ func TestLoginTerminalsHidden(t *testing.T) {
 	harden(t)
 	fixtures(t)
 	startDaemon(t, "allow_weak_host = true\n")
-	ptm, pts, err := pty.Open(24, 80) // stands for another login of alice
+	a := dialAs(alice)
+	defer a.Close()
+	say(a, wire.Request{Type: wire.Actor, Rows: 24, Cols: 80})
+	id := until(t, a, phase(wire.Prompt)).Session
+	if n := strings.Count(sh(t, "cat /proc/1/mountinfo"), " /dev/pts "); n != 1 {
+		t.Errorf("%d mounts on the host's /dev/pts", n)
+	}
+	// Opened after the session started, like a later login would be.
+	ptm, pts, err := pty.Open(24, 80)
 	must(err)
 	defer ptm.Close()
 	defer pts.Close()
@@ -145,10 +159,6 @@ func TestLoginTerminalsHidden(t *testing.T) {
 		n, _ := ptm.Read(b)
 		got <- string(b[:n])
 	}()
-	a := dialAs(alice)
-	defer a.Close()
-	say(a, wire.Request{Type: wire.Actor, Rows: 24, Cols: 80})
-	id := until(t, a, phase(wire.Prompt)).Session
 	b := join2(t, bob, id)
 	prog := fmt.Sprintf(`import os,glob
 print("tty", os.ttyname(0), sorted(os.listdir("/dev/pts")))

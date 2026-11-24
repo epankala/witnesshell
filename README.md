@@ -12,8 +12,8 @@ contractor access, four-eyes rules, and privileged work that must be reviewable
 afterwards.
 
 > [!WARNING]
-> **Under development.** Sessions work over SSH. There is no QUIC transport and
-> no audit log yet. This page describes the intended whole; parts not built yet
+> **Under development.** Sessions work over SSH and QUIC. A lost connection is
+> not resumed by itself, and there is no audit log yet. This page describes the intended whole; parts not built yet
 > are marked *planned*. Do not rely on it for security.
 
 ## Contents
@@ -47,8 +47,9 @@ afterwards.
      │ ◀── output ────────────────────┤──── the same output ──────────▶ │
 ```
 
-1. The actor logs in over SSH and starts a session. It will continue over QUIC,
-   to cope with packet loss and reconnect by itself. *(QUIC planned)*
+1. The actor logs in over SSH, which hands over a one-time token and the host's
+   certificate fingerprint. The session itself runs over QUIC (UDP), which copes
+   with packet loss.
 2. Witnesses log in with their own accounts and join that session.
 3. The actor types a line. It is parsed, expanded and checked; **nothing has
    run yet**.
@@ -258,7 +259,8 @@ secrets included.
 | Shell language and job control | ✅ done |
 | Daemon, approval screens, `view`, on-host `sign` | ✅ done |
 | Forced SSH login | ✅ done |
-| QUIC transport and reconnecting | 🚧 next |
+| QUIC transport | ✅ done |
+| Reconnecting by itself | 🚧 next |
 | Audit logs and recording | planned |
 | Hardening, packaging, releases | planned |
 
@@ -271,6 +273,7 @@ Not on a machine you care about yet. As root, with an account outside the group
 `witnesshell` as a way back in:
 
 ```sh
+# allow UDP port 60001 in the firewall
 install -m 755 witnesshell /usr/local/bin/
 groupadd -r witnesshell
 install -d -m 755 /etc/ssh/authorized_keys
@@ -290,8 +293,12 @@ requirements](#host-requirements) too; a refused session says what is missing.
 Each user, from their own machine:
 
 ```sh
-witnesshell connect alice@host      # or just: ssh alice@host
+witnesshell connect alice@host
 ```
+
+ssh options may precede the host. UDP port 60001 must be reachable; with a jump
+host, name the address with `--udp-host=HOST`. `witnesshell connect --ssh
+alice@host`, or plain `ssh alice@host`, works without UDP.
 
 On the host itself, `witnesshell attach` does the same.
 
@@ -309,6 +316,7 @@ approvals_required = 1
 max_sessions       = 0          # no limit
 detach_timeout     = "30m"
 exec_dirs          = ["/usr"]
+udp_port           = 60001      # 0 disables QUIC
 allow_weak_host    = false
 ```
 

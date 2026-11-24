@@ -71,14 +71,35 @@ func TestStubsReportNotImplemented(t *testing.T) {
 	}
 }
 
-func TestSSHArgs(t *testing.T) {
+func TestConnectArgs(t *testing.T) {
 	for in, want := range map[string]string{
-		"alice@h": "ssh -t -a -x -- alice@h", "-p 22 h": "ssh -t -a -x -p 22 -- h",
-		"": "", "-oProxyCommand=x": "", "h -v": "",
+		"alice@h": "ssh -a -x -T -- alice@h quic 1", "-p 22 h": "ssh -a -x -T -p 22 -- h quic 1",
+		"--ssh h": "ssh -a -x -T -- h quic 1", "--udp-host=1.2.3.4 -p 22 h": "ssh -a -x -T -p 22 -- h quic 1",
+		"": "", "-oProxyCommand=x": "", "h -v": "", "--udp-host= h": "ssh -a -x -T --udp-host= -- h quic 1", "--ssh": "",
 	} {
-		got, err := sshArgs(strings.Fields(in))
-		if strings.Join(got, " ") != want || (err == nil) != (want != "") {
+		o, err := parseConnect(strings.Fields(in))
+		got := ""
+		if err == nil {
+			got = strings.Join(o.argv([]string{"-T"}, quicCommand), " ")
+		}
+		if got != want {
 			t.Errorf("%q: %q %v", in, got, err)
+		}
+	}
+}
+
+func TestParseTicket(t *testing.T) {
+	fp, tok := strings.Repeat("a", 64), strings.Repeat("B", 43)
+	good := "WITNESSHELL 1 60001 " + fp + " " + tok
+	for in, ok := range map[string]bool{
+		good: true, "banner\n" + good + "\r\n": true, "": false, "x" + good: false, good + "x": false,
+		"WITNESSHELL 2 60001 " + fp + " " + tok: false, "WITNESSHELL 1 0 " + fp + " " + tok: false,
+		"WITNESSHELL 1 99999 " + fp + " " + tok: false, "WITNESSHELL 1 1 " + fp: false,
+		strings.Repeat("x", 70000) + "\n" + good: false,
+	} {
+		tk, err := parseTicket(strings.NewReader(in))
+		if (err == nil) != ok || ok && (tk.port != 60001 || tk.token != tok || tk.fingerprint != fp) {
+			t.Errorf("%.40q: %+v %v", in, tk, err)
 		}
 	}
 }

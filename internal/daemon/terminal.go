@@ -30,9 +30,10 @@ func Terminal() error {
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		return fmt.Errorf("unshare: %w", err)
 	}
-	// Only /dev stops propagating: "sudo mount" must still affect the host.
-	if err := unix.Mount("", "/dev", "", unix.MS_PRIVATE, ""); err != nil {
-		return fmt.Errorf("make /dev private: %w", err)
+	// What is mounted over /dev/pts must not propagate to the host, where later
+	// logins would use it. Everything else should: "sudo mount" must work.
+	if err := unix.Mount("", "/dev/pts", "", unix.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make /dev/pts private: %w", err)
 	}
 	if err := unix.Mount("devpts", "/dev/pts", "devpts", unix.MS_NOSUID|unix.MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620,gid=5"); err != nil {
 		return fmt.Errorf("mount devpts: %w", err)

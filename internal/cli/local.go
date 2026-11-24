@@ -19,7 +19,6 @@ import (
 
 	"witnesshell/internal/daemon"
 	"witnesshell/internal/sign"
-	"witnesshell/internal/ui"
 	"witnesshell/internal/view"
 	"witnesshell/internal/wire"
 )
@@ -51,6 +50,9 @@ func runDaemon(args []string, _, stderr io.Writer) int {
 	}
 	l, err := daemon.Listen(daemon.DefaultSocket)
 	if err != nil {
+		return fail(stderr, "daemon", err)
+	}
+	if err := d.ServeQUIC(); err != nil {
 		return fail(stderr, "daemon", err)
 	}
 	sig := make(chan os.Signal, 1)
@@ -153,27 +155,21 @@ func runAttach(args []string, stdout, stderr io.Writer) int {
 	if !term.IsTerminal(0) || !term.IsTerminal(1) {
 		return fail(stderr, "attach", errors.New("needs a terminal"))
 	}
-	for lobby := false; ; lobby = true {
-		next, err := attachOnce(*start, *id, lobby, stdout)
-		if err != nil {
-			return fail(stderr, "attach", err)
-		}
-		if !next {
-			return ExitOK
-		}
-		*start, *id = false, ""
+	if err := attachLoop(localDialer{}, *start, *id, stdout); err != nil {
+		return fail(stderr, "attach", err)
 	}
+	return ExitOK
 }
 
 // attachOnce joins one session. It reports whether to offer another: a
 // witness whose session ends may go on to a different one (D32).
-func attachOnce(start bool, id string, lobby bool, stdout io.Writer) (bool, error) {
+func attachOnce(d dialer, start bool, id string, lobby bool, stdout io.Writer) (bool, error) {
 	if lobby {
 		// Keys meant for the session that just ended must not choose.
 		time.Sleep(time.Second)
 		_ = unix.IoctlSetInt(0, unix.TCFLSH, unix.TCIFLUSH)
 	}
-	c, err := dial()
+	c, err := d.open()
 	if err != nil {
 		return false, err
 	}
@@ -185,8 +181,7 @@ func attachOnce(start bool, id string, lobby bool, stdout io.Writer) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	q.Version = wire.Version
-	res, err := ui.Run(c, q, os.Stdin, os.Stdout)
+	res, err := joinSession(d, c, q)
 	if err != nil {
 		if lobby { // for example, the session has ended meanwhile
 			fmt.Fprintf(stdout, "witnesshell: %s\n", err)

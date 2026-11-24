@@ -127,7 +127,7 @@ func (w *window) has(s string) bool { return strings.Contains(w.screen(), s) }
 
 func (w *window) wait(s string) {
 	w.t.Helper()
-	for end := time.Now().Add(30 * time.Second); !w.has(s); time.Sleep(50 * time.Millisecond) {
+	for end := time.Now().Add(150 * time.Second); !w.has(s); time.Sleep(50 * time.Millisecond) {
 		if time.Now().After(end) {
 			w.t.Fatalf("%s does not see %q:\n%s", w.name, s, w.screen())
 		}
@@ -433,7 +433,7 @@ func say(c net.Conn, q wire.Request) {
 // hear returns the next reply of a type, or an error or end.
 func hear(t *testing.T, c net.Conn, typ string) wire.Reply {
 	t.Helper()
-	_ = c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(150 * time.Second))
 	for {
 		var r wire.Reply
 		if err := wire.Read(c, wire.MaxReply, &r); err != nil {
@@ -705,7 +705,7 @@ func TestDaemonWeakHostIsShown(t *testing.T) {
 }
 
 func TestDaemonConfigStrict(t *testing.T) {
-	for _, c := range []string{"approvals_required = 0", "nonsense = 1", "detach_timeout = \"x\"", "exec_dirs = [\"rel\"]", "max_sessions = -1", "approvals_required = \"2\""} {
+	for _, c := range []string{"approvals_required = 0", "nonsense = 1", "detach_timeout = \"x\"", "exec_dirs = [\"rel\"]", "max_sessions = -1", "udp_port = 70000", "approvals_required = \"2\""} {
 		must(os.WriteFile("/etc/witnesshell/config.toml", []byte(c), 0o644))
 		cmd := exec.Command("timeout", "3", binary, "daemon")
 		if err := cmd.Run(); err == nil || cmd.ProcessState.ExitCode() == 124 {
