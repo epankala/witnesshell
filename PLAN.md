@@ -18,7 +18,7 @@
 | D9 | Recording: **asciicast v2** with markers per request (§8.1) |
 | D10 | Linux only, both ends |
 | D11 | Language: **Go**, static binary (`CGO_ENABLED=0`) |
-| D12 | Witness powers: **approve** or **reject with a comment**. The actor then submits a new command. Nothing else (no typing, no Ctrl-C, no kill) |
+| D12 | Witness powers: **approve** or **reject with a comment**. The actor then submits a new command. Nothing else (no typing, no Ctrl-C, no kill), except the read-only commands of D27 |
 | D13 | Actor disconnected **30 min** → treated as logout. A witness disconnecting does **not** remove votes already given |
 | D14 | On login with sessions active: **ask** "witness one of them / start own session". Several sessions allowed; `max_sessions = 1` can enforce a single session |
 | D15 | **Any rejection vetoes**, even if K approvals exist |
@@ -33,6 +33,8 @@
 | D24 | Command substitution (`$(...)` and backticks) at the prompt is **refused** for now; two-step approval (inner command, then the completed line) is a later option. Scripts run by an approved interpreter may use it |
 | D25 | A signed file still needs witness approval **every time** it runs |
 | D26 | Host requirements (§4.5: `noexec,nosuid` on user-writable filesystems, `vm.memfd_noexec=2`, no cron or user services for actors) are **required by default**; the config setting `allow_weak_host` skips the checks |
+| D27 | Actor **and** witnesses can view files and check a file's signature with built-in commands, **without approval** (§4.6) |
+| D28 | **Separate logs** for the actor and each witness: `witnesshell-<session start>-actor-<name>` and `witnesshell-<same session start>-witness-<name>` (§8) |
 
 ## 1. Goal
 
@@ -225,6 +227,30 @@ script and machine code it builds in its own memory (Python could allocate
 writable+executable memory under every variant). Approving one trusts the
 actor with it (D17). Approved root (`sudo`) can undo everything.
 
+### 4.6 Commands without approval (D27)
+| Command | Does |
+|---|---|
+| `view FILE` | built-in pager, like `less`; content, owner, mode and SHA-256 |
+| `checksig FILE` | trusted / signed by whom / neither, and the SHA-256 |
+
+Both start no program. Rules:
+- They run with the **caller's own** file permissions, never the daemon's:
+  the actor's view as the actor, a witness's view as that witness. Files only
+  root may read still need an approved `sudo` command.
+- Only a line that is exactly one such command skips approval. Combined with
+  a pipe, redirection, `;`, `&&` or `&` it is refused.
+- The pager has no shell escape, no editor and no saving to a file. Content is
+  shown with control and invisible characters escaped, so a file cannot send
+  commands to the terminal.
+- Regular files only, checked after opening without blocking, so FIFOs and
+  devices cannot hang the session or have side effects. Reading is by chunks.
+- Pressing a key in the pager never reaches a program or the PTY.
+- The actor's view is part of the mirrored screen and is recorded. A witness's
+  view is private to that witness, works while a request is pending, and
+  resolves relative paths from the actor's current directory.
+- A viewed file can change before a command uses it. The SHA-256 lets a
+  witness compare; for signed files the stored copy runs (§4.4).
+
 ## 5. Authorisation & config (D5, D13, D14)
 
 Any member of group `witnesshell` who logs in may witness any session they
@@ -276,7 +302,7 @@ connected, and either the draft or the request state:
 
 **Witness:** a read-only mirror of the actor's screen plus a 2-line panel
 showing the live draft or pending request:
-- keys: `[a] approve` and `[r] reject`. Reject prompts for a comment, and
+- keys: `[a] approve`, `[r] reject`, `[v] view file`, `[s] check signature`. Reject prompts for a comment, and
   the comment is required.
 - the panel shows who has approved so far.
 - a bell rings on each new request.
@@ -285,21 +311,37 @@ Witness keystrokes never reach the PTY.
 
 ## 8. Audit
 
-Each session has an append-only JSON-lines log, `/var/log/witnesshell/<session>.log`.
-It records:
-- session start/end
-- actor
-- each witness join/leave
-- each request: its text, every vote (uid, time, comment) and the outcome
-- RUNNING start/end
-- queue purge.
+Each participant has an append-only JSON-lines log in `record_dir`, named by
+session start (UTC, milliseconds) and user (D28):
 
-Each entry carries the SHA-256 of the previous one, forming a chain.
-`witnesshell audit verify <file>` checks the chain.
+```
+witnesshell-20261124T101500.123Z-actor-alice.log
+witnesshell-20261124T101500.123Z-actor-alice.cast
+witnesshell-20261124T101500.123Z-witness-bob.log
+witnesshell-20261124T101500.123Z-witness-carol.log
+```
+
+Every file of a session uses the same session start, whenever the witness
+joined. A witness who reconnects continues the same file. The daemon never
+gives two sessions the same start time. Files are owned by root, mode 0600.
+
+| Event | Actor log | Witness log |
+|---|---|---|
+| Session start/end, host, `allow_weak_host` warning | yes | yes |
+| Joins and leaves | all witnesses | own |
+| Request text, resolved program, SHA-256, outcome | yes | yes, while joined |
+| Votes and comments (uid, time) | all | own |
+| `view`, `checksig`: path, SHA-256, result (not content) | own | own |
+| Command start, end, exit status; queue purge | yes | no |
+
+Each entry carries the SHA-256 of the previous one, forming a chain per file.
+Votes carry the request ID and hash in both logs, and the final hash of every
+witness log goes into the actor log, so a removed or altered file is noticed.
+`witnesshell audit verify <session start>` checks a session's files together.
 
 ### 8.1 Recording: asciicast v2 (D9)
 
-The recording is one `<session>.cast` file next to the log. asciicast v2
+The recording is one `.cast` file next to the actor log. asciicast v2
 was chosen over v3, `script`/`scriptreplay`, ttyrec and tlog because it has
 the widest replay support (`asciinema play`, the web player, `agg` for
 GIF) and is written one line at a time, so a crash loses at most the
@@ -315,8 +357,8 @@ Contents:
 - **no `i` (input) events**, so passwords typed in RUNNING state never end
   up in the file.
 
-When the session ends, the cast file's SHA-256 is written into the audit
-chain.
+When the session ends, the cast file's SHA-256 is written into the actor
+log. Witnesses have no recording of their own; they see the same screen.
 
 ## 9. Dependencies (Go, D11)
 
@@ -345,7 +387,8 @@ internal/trust/         file trust rules, signatures, signed store
 internal/launch/        root launcher, Landlock, uid switch, job control
 internal/session/       joins gate + shell, VT emulator
 internal/gate/          draft editor, request state machine, votes, K-of-N, veto
-internal/audit/         hash-chained log, asciicast writer
+internal/view/          read-only pager and signature check (D27)
+internal/audit/         hash-chained actor and witness logs, asciicast writer
 internal/ui/            actor status bar, witness panel
 deploy/                 systemd unit, sshd_config snippet, example config.toml
 test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
@@ -359,11 +402,11 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
 | M2a | Trust & launcher | trust rules, signed store, uid switch, Landlock, host checks; every attack in §4.5 is a VM regression test (`make vm-test`) |
 | M2b | Shell language | strict parser, expansion to exact plan, job control, Ctrl-C/Z; attack tests ported from `internal/shell`, which is then removed |
-| M2c | Local session | gate + shell + daemon; actor and witness over the **unix socket** on one host (no network yet) |
+| M2c | Local session | gate + shell + daemon; `view`/`checksig`; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
-| M6 | Audit & recording | hash-chained log, asciicast with markers, `audit verify`; replay checked with `asciinema play` |
+| M6 | Audit & recording | separate hash-chained actor and witness logs, asciicast with markers, `audit verify`; replay checked with `asciinema play` |
 | M7 | Hardening & release | fuzz proto decoder, privilege-drop review, systemd unit, README (incl. D16 git-diff rule, §3.2 warning), release binaries |
 
 ## 12. Known limitations
