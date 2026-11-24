@@ -5,8 +5,8 @@ only after **K-of-N witnesses** approve each command line. Any witness can
 veto a command with a comment. Sessions are bootstrapped over SSH, then run
 over QUIC, and are logged and recorded as asciicast.
 
-Status: **M2 in progress** – approval logic and shell exist but are not connected to a daemon or each
-other, so nothing is usable yet; see [PLAN.md](PLAN.md)
+Status: **M2a done** – approval logic, trust rules, signing and the root
+launcher exist but nothing connects them yet, so it is not usable; see [PLAN.md](PLAN.md)
 for the design and milestones.
 
 ## Build
@@ -27,6 +27,7 @@ is writable, else slow emulation. Reachable on localhost only.
 ```sh
 make vm-start   # first run downloads an Ubuntu 26.04 image (860 MB)
 make vm-ssh     # log in as vmadmin (root via sudo); VM_USER=alice for an actor
+make vm-test    # attack tests as root in the VM (hardens the VM first)
 make vm-status
 make vm-stop    # keeps the disk
 make vm-reset   # stops and discards the disk

@@ -52,6 +52,14 @@ clean:
 -include local.mk
 export VM_DIR VM_QEMU_ROOT VM_SSH_PORT VM_MEM VM_CPUS VM_USER
 
+# Runs the attack tests as root inside the VM, starting it if needed.
+.PHONY: vm-test
+vm-test: vm-start
+	$(GO) vet -tags vmtest ./test/vm
+	GOOS=linux GOARCH=amd64 $(GO) test -c -tags vmtest -o $(DIST)/vm.test ./test/vm
+	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/lib/vm.test && chmod 755 /usr/local/lib/vm.test"' <$(DIST)/vm.test
+	@VM_USER=vmadmin sh scripts/vm.sh ssh 'cd / && sudo timeout 900 /usr/local/lib/vm.test -test.v $(VMTEST_ARGS)' </dev/null
+
 .PHONY: vm-start vm-stop vm-status vm-ssh vm-reset
 vm-start vm-stop vm-status vm-ssh vm-reset: vm-%:
 	@sh scripts/vm.sh $*

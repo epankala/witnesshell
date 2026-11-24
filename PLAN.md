@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 and M1 done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; `internal/shell` (bash on a socket) is superseded. Next: M2a.
+> Status: M0, M1 and M2a done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; `internal/shell` (bash on a socket) is superseded. Next: M2b.
 
 ## 0. Decisions
 
@@ -182,7 +182,13 @@ it must be **signed**. Loose ends that count as files to check:
 - `#!` interpreters must be trusted.
 - For known interpreters, script arguments (`python3 x.py`, `sh x.sh`), also
   behind `sudo`, `env`, `nice` and similar.
-- `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PYTHONPATH` etc. are stripped.
+- Commands get a fresh environment with a fixed `PATH`. Exporting variables
+  that load code (`LD_*`, `PYTHON*`, `PAGER`, `GIT_*`, ...) is refused.
+- Options not known to take no value make every argument count as a possible
+  script. This can refuse a harmless line, such as `bash -c ./data`.
+- Interpreters and wrappers are recognized by name (`internal/launch`); one
+  under an unknown name is not.
+- Redirections are M2b's job: `sh < mine.sh` must check the file.
 
 **Signed files.** The daemon hashes the file, checks the signature, and copies
 it to a root-owned store `/var/lib/witnesshell/signed/<sha256>`; the copy is
@@ -212,10 +218,18 @@ Tested in the VM (Ubuntu 26.04, kernel 7.0), as alice started by root.
 (*) Blocked, but probably only because the test hid the user's bus socket.
 Treat as an escape. memfd was blocked with `vm.memfd_noexec=2` (with both).
 
+Implemented and tested in M2a (`make vm-test`): uid switch, Landlock, trust
+policy, signed store, host checks. Every attack above is a test, as are the
+known limits (an unsigned script read by an approved interpreter or piped to
+it, machine code in memory, programs copied or started through `sudo`).
+Landlock also stops remounting inside a user namespace.
+
 Consequences:
 - **Host requirements:** every filesystem the actor can write to is mounted
   `noexec,nosuid` host-wide (so cron and user services are covered too);
-  `vm.memfd_noexec=2`; cron/at and user services denied to actors. The daemon
+  `vm.memfd_noexec=2`; cron/at and user services denied to actors. Besides
+  `/home` and `/tmp`, places such as `/run/screen`, `/run/lock`, `/var/crash` and
+  `/dev/shm` count; the check scans for them (3 s in the VM). The daemon
   checks these and refuses to start otherwise (`allow_weak_host` overrides).
 - **Landlock** exec rules apply to commands not run through `sudo`, because
   they break `sudo mount`. `sudo` needs root's power; witnesses decide.
@@ -402,7 +416,7 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
 | M2a | Trust & launcher | trust rules, signed store, uid switch, Landlock, host checks; every attack in §4.5 is a VM regression test (`make vm-test`) |
 | M2b | Shell language | strict parser, expansion to exact plan, job control, Ctrl-C/Z; attack tests ported from `internal/shell`, which is then removed |
-| M2c | Local session | gate + shell + daemon; `view`/`checksig`; actor and witness over the **unix socket** on one host (no network yet) |
+| M2c | Local session | gate + shell + daemon; `witnesshell sign`; `view`/`checksig`; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
