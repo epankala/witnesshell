@@ -7,7 +7,7 @@ Bold); letters are converted to outlines so the SVGs have no font dependency.
 """
 import math, pathlib, sys
 OUT = pathlib.Path(__file__).resolve().parent
-INK, DARK = "#10203a", "#0a1020"
+INK, DARK, LID = "#10203a", "#0a1020", "#0c0f1f"
 L, R, CX = 58, 454, 256      # corners of the mouth
 MY = 318                     # height of the corners
 n = lambda v: f"{v:.1f}".rstrip("0").rstrip(".")
@@ -32,33 +32,111 @@ def ribs(depth, apex, k, belly):
         s += f"M{n(x)} {n(y)}Q{n(CX+(x-CX)*.88)} {n(y+(apex-y)*belly)} {n(ax)} {n(apex)}"
     return s
 
-def tongue(x, y, w, h, sway, f=1.0):
-    """One upward flame, base centre x,y; f shrinks it for the inner layers."""
-    w, h, sway = w*f, h*f, sway*f
-    m = -1 if sway < 0 else 1            # drawn leaning right, mirrored if needed
-    sway = abs(sway)
-    P = lambda dx, dy: f"{n(x+m*dx)} {n(y-dy)}"
-    return (f"M{P(-w/2,0)}C{P(-w/2,h*.4)} {P(sway-w*.12,h*.5)} {P(sway,h)}"
-            f"C{P(sway+w*.16,h*.7)} {P(w/2,h*.4)} {P(w/2,0)}Z")
+def smooth(pts):
+    """Closed Catmull-Rom curve; a point given as (x, y, 1) is a sharp tip."""
+    N = len(pts); d = f"M{n(pts[0][0])} {n(pts[0][1])}"
+    def tan(i):
+        if len(pts[i]) > 2: return 0, 0
+        a, b = pts[i-1], pts[(i+1) % N]
+        return (b[0]-a[0])/6, (b[1]-a[1])/6
+    for i in range(N):
+        a, b = pts[i], pts[(i+1) % N]; ta, tb = tan(i), tan((i+1) % N)
+        d += f"C{n(a[0]+ta[0])} {n(a[1]+ta[1])} {n(b[0]-tb[0])} {n(b[1]-tb[1])} {n(b[0])} {n(b[1])}"
+    return d + "Z"
 
-# x, y of the base, width, height, lean
-BACK = [(62,351,84,206,-18),(122,262,96,196,-16),(192,206,92,158,-10),
-        (262,200,92,186,10),(330,206,92,150,12),(396,262,96,212,18),(450,351,84,192,18)]
-SMALL_BACK = [(62,351,96,210,-18),(160,250,120,208,-16),(262,200,110,180,10),(362,250,120,216,16),(450,351,96,220,18)]
-COLS = [("#e5352b",1),("#ff8a1f",.76),("#ffd23f",.52)]
+def lick(x, y, w, length, start, end, wig, f):
+    """A flame whose heading (degrees, 90 = up) turns from start to end while
+    it wiggles; f shrinks it for the hotter inner layers."""
+    w, length, K = w*f, length*(.35+.65*f), 9
+    left, right = [], []
+    for i in range(K+1):
+        t = i/K
+        a = math.radians(start+(end-start)*min(1, t*1.25)+wig*math.sin(2*math.pi*t*1.05))
+        hw = w/2*(1-t)**.85*(1+.25*math.sin(math.pi*t))
+        if i < K:
+            left.append((x-hw*math.sin(a), y-hw*math.cos(a)))
+            right.append((x+hw*math.sin(a), y+hw*math.cos(a)))
+            x += length/K*math.cos(a); y -= length/K*math.sin(a)
+    return smooth(left+[(x, y, 1)]+right[::-1])
 
-def flames(ts):
+# x, y of the root, width, length, start heading, end heading, wiggle
+BACK = [
+    # crown
+    (256,190,92,200,96,82,26),(206,196,76,150,104,100,-24),(310,194,78,166,80,96,28),
+    # horns: long, sweeping out and hooking back in
+    (150,232,92,262,140,62,14),(364,232,92,270,40,120,-14),
+    # shoulders and sides
+    (116,270,70,190,150,104,-18),(398,270,70,196,30,76,18),
+    (84,312,66,186,166,104,14),(430,312,66,178,14,74,-14),
+    (84,352,60,166,184,118,12),(430,352,60,174,-4,60,-12),
+    # underside, raking outward
+    (120,384,58,170,196,134,10),(394,384,58,178,-16,44,-10),
+    (164,408,50,150,204,150,10),(350,408,50,158,-24,28,-10),
+    (214,420,44,140,212,172,10),(300,420,44,146,-32,6,-10)]
+SMALL_BACK = [(256,200,120,200,96,84,18),(150,240,130,262,140,62,10),(364,240,130,270,40,120,-10),
+    (84,330,110,210,160,82,8),(428,330,110,216,20,98,-8),(130,380,120,180,190,96,6),(382,380,120,190,-10,84,-6)]
+EMBERS = [(62,40,8),(222,-30,7),(332,-24,6),(458,36,7),(22,168,6),(494,160,6),(98,-30,5),(424,-34,5),(-20,240,5),(534,244,5)]
+COLS = [("#3d0610",1.2),("#a80f1a",1),("#ec3414",.74),("#ff8a12",.48),("#ffd84a",.24)]
+
+def flames(small):
     s = ""
-    for c, f in COLS:
-        rx, ry = 236-(1-f)*42, 138-(1-f)*38      # body of fire under the shell
-        ds = [f"M{n(CX-rx)} 350A{n(rx)} {n(ry)} 0 0 0 {n(CX+rx)} 350Z"]
-        ds += [tongue(*t, f) for t in ts]
-        s += f'<g fill="{c}">' + "".join(f'<path d="{d}"/>' for d in ds) + "</g>\n"
+    for c, f in COLS[1 if small else 0:]:
+        ds = [lick(*t, f) for t in (SMALL_BACK if small else BACK)]
+        s += f'<g fill="{c}">' + "".join(f'<path d="{d}"/>' for d in ds)
+        # fire body behind the shell, so no gaps show between roots
+        s += f'<ellipse cx="256" cy="312" rx="{n(192+8*f)}" ry="{n(130+10*f)}"/></g>\n'
+    if not small:
+        for x, y, r in EMBERS:
+            d = f"M{x} {n(y-r*1.7)}Q{n(x+r*1.1)} {y} {x} {n(y+r*1.5)}Q{n(x-r*1.1)} {y} {x} {n(y-r*1.7)}Z"
+            s += f'<path fill="#f4511e" d="{d}"/>'
+    return s
+
+def eye(x, y, r, side, mood, iris, dim, look):
+    """One eye; side is -1 for the left eye of a pair, 1 for the right."""
+    X = lambda dx: n(x+side*dx*r)        # +dx points away from the nose
+    Y = lambda dy: n(y+dy*r)
+    ir, pr = (.66, .46) if mood != "worried" else (.5, .27)
+    lx, ly = x+look[0]*r, y+look[1]*r
+    o = (f'<g opacity="{dim}"><ellipse cx="{n(x)}" cy="{n(y)}" rx="{n(r)}" ry="{n(r*1.12)}" fill="#fff6dc"/>'
+         f'<circle cx="{n(lx)}" cy="{n(ly)}" r="{n(ir*r)}" fill="{iris}"/>'
+         f'<circle cx="{n(lx)}" cy="{n(ly)}" r="{n(pr*r)}" fill="{DARK}"/>'
+         f'<circle cx="{n(lx+.22*r)}" cy="{n(ly-.24*r)}" r="{n(.2*r)}" fill="#fff"/></g>\n')
+    cid = f"e{n(x)}-{n(y)}".replace(".", "_")     # lids stay within their own eye
+    o += f'<clipPath id="{cid}"><ellipse cx="{n(x)}" cy="{n(y)}" rx="{n(r+1)}" ry="{n(r*1.12+1)}"/></clipPath>'
+    lid = lambda d: f'<path clip-path="url(#{cid})" fill="{LID}" d="{d}"/>\n'
+    if mood == "friendly":               # cheeks push the lower lid up
+        o += lid(f"M{X(-1.3)} {Y(1.5)}V{Y(1.0)}Q{X(0)} {Y(.12)} {X(1.3)} {Y(1.0)}V{Y(1.5)}Z")
+    elif mood == "worried":              # upper lid and brow rise to the nose
+        o += lid(f"M{X(-1.2)} {Y(-1.4)}V{Y(-1.12)}L{X(1.25)} {Y(-.12)}V{Y(-1.4)}Z")
+        if r > 15:
+            o += (f'<path d="M{X(-.75)} {Y(-1.42)}Q{X(.1)} {Y(-1.32)} {X(1.05)} {Y(-.72)}" fill="none" stroke="#8d7ba8" '
+              f'stroke-opacity="{dim}" stroke-width="{n(r*.2)}" stroke-linecap="round"/>\n')
+    else:                                # suspicious: lids narrowed, down to the nose
+        o += lid(f"M{X(-1.2)} {Y(-1.4)}V{Y(.0)}L{X(1.25)} {Y(-.75)}V{Y(-1.4)}Z")
+        o += lid(f"M{X(-1.2)} {Y(1.4)}V{Y(.8)}Q{X(0)} {Y(.62)} {X(1.2)} {Y(.8)}V{Y(1.4)}Z")
+    return o
+
+# centre x, y, eye radius, spacing, mood, iris, opacity, gaze, tilt of the pair
+PAIRS = [
+    (256,322,30,70,"friendly","#7a3b12",1,(0,.06),0),
+    (137,322,19,46,"worried","#3f8fd0",1,(.12,.18),-5),
+    (375,322,20,46,"suspicious","#c98a10",1,(-.34,.08),4),
+    (186,278,14,32,"suspicious","#d0432f",.8,(.3,.1),-5),
+    (328,277,14,31,"worried","#9a6be0",.8,(-.1,.15),5),
+    (192,366,14,30,"friendly","#3c9d5b",.8,(.1,-.1),4),
+    (322,367,15,32,"suspicious","#2f9aa8",.8,(-.3,.05),-4)]
+SMALL_PAIRS = [(256,322,52,122,"friendly","#7a3b12",1,(0,.06),0)]
+
+def eyes_svg(pairs):
+    s = ""
+    for x, y, r, gap, mood, iris, dim, look, tilt in pairs:
+        es = "".join(eye(x+sd*gap/2, y, r, sd, mood, iris, dim, look) for sd in (-1, 1))
+        s += f'<g transform="rotate({tilt} {x} {y})">{es}</g>\n'
     return s
 
 def mark(small=False):
     k = 5 if small else 7
-    up, dn = (-80, 76) if small else (-64, 62)
+    up, dn = (-86, 80) if small else (-84, 82)
     sw = 15 if small else 9
     ux, dx = (24 if small else 22), (-14 if small else -16)
     upper = (f"M{L} {MY}{lip_path(up,ux,k)}C{R+26} {MY-50} {R-66} 168 {CX+40} 152"
@@ -67,32 +145,19 @@ def mark(small=False):
     # inside of the shell, seen through the gap
     def arc(d): return f"M{L} {MY}"+"C"+f"{L+50} {n(MY+d*1.33)} {R-50} {n(MY+d*1.33)} {R} {MY}"
     inside = arc(up-6)+f"C{R-50} {n(MY+(dn+14)*1.33)} {L+50} {n(MY+(dn+14)*1.33)} {L} {MY}Z"
-    band = "" if small else (f'<path d="M{L+42} 268Q{CX} 152 {R-42} 268M{L+104} 214Q{CX} 144 {R-104} 214" '
+    band = "" if small else (f'<path d="M{L+42} 258Q{CX} 138 {R-42} 258" '
         'fill="none" stroke="#baf5e6" stroke-opacity=".5" stroke-width="9" stroke-linecap="round"/>\n')
-    e = 1.45 if small else 1.08
-    eyes, off = "", 62 if small else 54
-    for x, side in ((CX-off,-1),(CX+off,1)):
-        rx, ry, y = 37*e, 43*e, 316
-        eyes += f'''<g><ellipse cx="{x}" cy="{y}" rx="{n(rx)}" ry="{n(ry)}" fill="#fff6dc"/>
-<circle cx="{n(x-side*5)}" cy="{n(y+3)}" r="{n(25*e)}" fill="#7a3b12"/>
-<circle cx="{n(x-side*5)}" cy="{n(y+3)}" r="{n(18*e)}" fill="{DARK}"/>
-<circle cx="{n(x-side*5+8)}" cy="{n(y-7)}" r="{n(8.5*e)}" fill="#fff"/>
-''' + ("" if small else f'<circle cx="{n(x-side*5-8)}" cy="{n(y+12)}" r="4" fill="#fff"/>\n') + "</g>\n"
-    # lower lids: cheeks pushing up, so the eyes smile
-    low = 16 if small else 0
-    for x in (CX-off, CX+off):
-        eyes += f'<path fill="{DARK}" d="M{x-off} 400V{366+low}Q{x} {322+low} {x+off} {366+low}V400Z"/>\n'
     j = 'stroke-linejoin="round" stroke-linecap="round"'
-    return f'''<defs>
+    return f'''<g transform="translate(256 256) scale({.85 if small else .775}) translate(-256 {-256 if small else -228})"><defs>
 <linearGradient id="u" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1f8f96"/><stop offset="1" stop-color="#5fd6c8"/></linearGradient>
 <linearGradient id="d" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#42bdb4"/><stop offset="1" stop-color="#16697a"/></linearGradient>
-<radialGradient id="g" cx=".5" cy=".55" r=".5"><stop offset="0" stop-color="#2b2140"/><stop offset="1" stop-color="{DARK}"/></radialGradient>
 </defs>
-{flames(SMALL_BACK if small else BACK)}<path d="{inside}" fill="{DARK if small else 'url(#g)'}" stroke="{INK}" stroke-width="{sw}" {j}/>
-{eyes}<path d="{lower}" fill="url(#d)" stroke="{INK}" stroke-width="{sw}" {j}/>
+{flames(small)}<path d="{inside}" fill="{LID}" stroke="{INK}" stroke-width="{sw}" {j}/>
+{eyes_svg(SMALL_PAIRS if small else PAIRS)}<path d="{lower}" fill="url(#d)" stroke="{INK}" stroke-width="{sw}" {j}/>
 <path d="{"" if small else ribs(dn,450,k,.55)}" fill="none" stroke="{INK}" stroke-opacity=".55" stroke-width="{sw*.6:.1f}" {j}/>
 <path d="{upper}" fill="url(#u)" stroke="{INK}" stroke-width="{sw}" {j}/>
 {band}<path d="{ribs(up,154,k,.5)}" fill="none" stroke="{INK}" stroke-opacity=".55" stroke-width="{sw*.6:.1f}" {j}/>
+</g>
 '''
 
 def svg(body, w=512, h=512):
@@ -118,7 +183,7 @@ def wordmark(font, ink, size, x, y):
 files = {"witnesshell.svg": svg(mark()), "witnesshell-icon.svg": svg(mark(True))}
 if len(sys.argv) > 1:
     for name, ink in (("light", INK), ("dark", "#f3f6fa")):
-        t, x = wordmark(sys.argv[1], ink, 190, 520, 366)
+        t, x = wordmark(sys.argv[1], ink, 190, 520, 384)
         files[f"witnesshell-wordmark-{name}.svg"] = svg(mark()+t, round(x+30))
 for name, s in files.items(): (OUT/name).write_text(s)
 try:
