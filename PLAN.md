@@ -30,6 +30,7 @@
 | D21 | `sudo` stays (D7) for now |
 | D22 | Signing happens off the host (signature copied in) or on the host. One witness signature is enough; the actor's own does not count |
 | D23 | Root and sandbox tests run in a **VM** (`make vm-start`), used over ssh |
+| D24 | Command substitution (`$(...)` and backticks) at the prompt is **refused** for now; two-step approval (inner command, then the completed line) is a later option. Scripts run by an approved interpreter may use it |
 
 ## 1. Goal
 
@@ -167,7 +168,8 @@ Its interpreter is not used: 35 of 45 sample scripts matched bash, and `kill`,
 
 **What witnesses approve.** Besides the text: resolved program path, expanded
 arguments, owner, and trusted/signed status. Exactly that is executed. Words
-that cannot be known beforehand (such as command substitution) are refused.
+that cannot be known beforehand are refused: command substitution (D24) and
+process substitution (`<(...)`), which has the same problem.
 
 ### 4.4 What may run (D18–D20, D22)
 A file is **trusted** if it, and every directory on its resolved path, is not
