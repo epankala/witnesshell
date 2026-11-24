@@ -35,6 +35,7 @@
 | D26 | Host requirements (§4.5: `noexec,nosuid` on user-writable filesystems, `vm.memfd_noexec=2`, no cron or user services for actors) are **required by default**; the config setting `allow_weak_host` skips the checks |
 | D27 | Actor **and** witnesses can view files and check a file's signature with built-in commands, **without approval** (§4.6) |
 | D28 | **Separate logs** for the actor and each witness: `witnesshell-<session start>-actor-<name>` and `witnesshell-<same session start>-witness-<name>` (§8) |
+| D29 | A request that starts an interpreter without a checked script file (`python3`, `sh`, `bash -c ...`), also behind `sudo` and similar, shows witnesses the warning **"this allows unsigned code"** |
 
 ## 1. Goal
 
