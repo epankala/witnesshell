@@ -5,9 +5,9 @@ only after **K-of-N witnesses** approve each command line. Any witness can
 veto a command with a comment. Sessions are bootstrapped over SSH, then run
 over QUIC, and are logged and recorded as asciicast.
 
-Status: **M2a done** – approval logic, trust rules, signing and the root
-launcher exist but nothing connects them yet, so it is not usable; see [PLAN.md](PLAN.md)
-for the design and milestones.
+Status: **M2b done** – approval logic, trust rules, signing, launcher, shell
+language and job control exist. There is no daemon or approval screen yet, so
+it is not usable; see [PLAN.md](PLAN.md) for the design and milestones.
 
 ## Build
 

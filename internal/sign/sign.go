@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -21,6 +22,9 @@ import (
 
 // Namespace separates our signatures from other uses of the same SSH key.
 const Namespace = "witnesshell"
+
+// DefaultStoreDir is the production store.
+const DefaultStoreDir = "/var/lib/witnesshell"
 
 // MaxFile and maxSig bound what is read on the actor's behalf.
 const (
@@ -129,7 +133,7 @@ type Store struct {
 
 // Init creates the directories.
 func (s *Store) Init() error {
-	for d, m := range map[string]os.FileMode{s.Dir: 0o711, s.signedDir(): 0o711, s.recordDir(): 0o700} {
+	for d, m := range map[string]os.FileMode{s.Dir: 0o711, s.signedDir(): 0o711, s.recordDir(): 0o711, s.tmpDir(): 0o700} {
 		if err := os.MkdirAll(d, m); err != nil {
 			return err
 		}
@@ -143,17 +147,41 @@ func (s *Store) Init() error {
 func (s *Store) signedDir() string { return filepath.Join(s.Dir, "signed") }
 func (s *Store) recordDir() string { return filepath.Join(s.Dir, "records") }
 
-// Record notes that uid, authenticated by the caller, signed content d.
+func (s *Store) tmpDir() string { return filepath.Join(s.Dir, "tmp") }
+
+// Record notes that uid, authenticated by the caller, signed content d. A
+// record is readable by anyone who knows the content, writable by root only.
 func (s *Store) Record(uid uint32, d Digest) error {
-	f, err := os.OpenFile(s.recordName(uid, d), os.O_CREATE|os.O_WRONLY, 0o600)
+	uids, err := s.recorded(d)
+	if err != nil || slices.Contains(uids, uid) {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(s.recordDir(), d.Hex()), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
-	return f.Close()
+	_, err = fmt.Fprintln(f, uid)
+	return errors.Join(err, f.Close())
 }
 
-func (s *Store) recordName(uid uint32, d Digest) string {
-	return filepath.Join(s.recordDir(), d.Hex()+"."+strconv.FormatUint(uint64(uid), 10))
+// recorded returns who signed d on the host.
+func (s *Store) recorded(d Digest) ([]uint32, error) {
+	b, err := os.ReadFile(filepath.Join(s.recordDir(), d.Hex()))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []uint32
+	for _, l := range strings.Fields(string(b)) {
+		uid, err := strconv.ParseUint(l, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("corrupt signing record %s", d.Hex())
+		}
+		out = append(out, uint32(uid))
+	}
+	return out, nil
 }
 
 // Hash returns the digest of r.
@@ -166,10 +194,18 @@ type Signed struct {
 	Path   string   // root-owned copy; empty from Check
 }
 
-// Check reports who signed content d, ignoring the actor's own signatures.
-// armored may be nil if there is no signature file.
-func (s *Store) Check(d Digest, armored []byte, actor uint32) (*Signed, error) {
-	out := &Signed{Digest: d}
+// Signer is one valid signature.
+type Signer struct {
+	Name string // "uid N" for on-host signatures
+	UID  uint32
+	key  bool // made with an SSH key rather than on the host
+}
+
+// Signers returns every valid signature on content d, for whichever actor.
+// armored may be nil if there is no signature file. The error explains why
+// armored was not accepted; on-host signatures are returned regardless.
+func (s *Store) Signers(d Digest, armored []byte) ([]Signer, error) {
+	var out []Signer
 	var sigErr error
 	if armored != nil {
 		var users []string
@@ -180,22 +216,28 @@ func (s *Store) Check(d Digest, armored []byte, actor uint32) (*Signed, error) {
 				sigErr = fmt.Errorf("signer %q: %w", u, err)
 				continue
 			}
-			if uid == actor {
-				// A key the actor holds proves nothing, whoever else is listed.
-				out.By, sigErr = nil, errors.New("signed with the actor's own key")
-				break
-			}
-			out.By = append(out.By, u)
+			out = append(out, Signer{u, uid, true})
 		}
 	}
-	ents, err := filepath.Glob(filepath.Join(s.recordDir(), d.Hex()+".*"))
-	if err != nil {
-		return nil, err
+	uids, err := s.recorded(d)
+	for _, uid := range uids {
+		out = append(out, Signer{"uid " + strconv.FormatUint(uint64(uid), 10), uid, false})
 	}
-	for _, e := range ents {
-		uid, err := strconv.ParseUint(strings.TrimPrefix(filepath.Ext(e), "."), 10, 32)
-		if err == nil && uint32(uid) != actor {
-			out.By = append(out.By, "uid "+strconv.FormatUint(uid, 10))
+	return out, errors.Join(sigErr, err)
+}
+
+// Check reports who signed content d, ignoring the actor's own signatures.
+func (s *Store) Check(d Digest, armored []byte, actor uint32) (*Signed, error) {
+	all, sigErr := s.Signers(d, armored)
+	// A key the actor holds proves nothing, whoever else is listed with it.
+	ownKey := slices.ContainsFunc(all, func(g Signer) bool { return g.key && g.UID == actor })
+	if ownKey {
+		sigErr = errors.New("signed with the actor's own key")
+	}
+	out := &Signed{Digest: d}
+	for _, g := range all {
+		if g.UID != actor && !(g.key && ownKey) {
+			out.By = append(out.By, g.Name)
 		}
 	}
 	if len(out.By) == 0 {
@@ -210,7 +252,7 @@ func (s *Store) Check(d Digest, armored []byte, actor uint32) (*Signed, error) {
 // Install copies r into the store if its content is signed. What is checked
 // is the copy, so changing the original afterwards has no effect.
 func (s *Store) Install(r io.Reader, armored []byte, actor uint32) (*Signed, error) {
-	tmp, err := os.CreateTemp(s.recordDir(), "tmp-") // mode 0600, private directory
+	tmp, err := os.CreateTemp(s.tmpDir(), "tmp-") // mode 0600, private directory
 	if err != nil {
 		return nil, err
 	}

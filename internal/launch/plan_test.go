@@ -172,3 +172,56 @@ func TestRootRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestInterpreterWarning(t *testing.T) {
+	p, u, d := setup(t)
+	f, _ := os.Open(filepath.Join(d, "x.sh"))
+	dg, _ := sign.Hash(f)
+	f.Close()
+	if err := p.Store.Record(u.UID+1, dg); err != nil {
+		t.Fatal(err)
+	}
+	for c, want := range map[string]bool{
+		"sh": true, "python3": true, "sh -c true": true, "sh -c true /usr/bin/env": true, "sudo sh": true, "env sh -c true": true,
+		"sudo -u root python3": true, "sh -i": true, "xargs sh": true, "awk 1": true, "sh -": true,
+		"ls": false, "sudo ls": false, "sh x.sh": false, "./x.sh": false, "sudo sh x.sh": false, "env ./x.sh": false,
+		"sh x.sh -c evil": false, "env sh x.sh sh": true,
+	} {
+		argv := strings.Split(c, " ")
+		if !strings.Contains(argv[0], "/") && !need(t, argv[0]) {
+			continue
+		}
+		pl, err := p.Plan(Request{Argv: argv, Cwd: d, User: u})
+		if err != nil || (len(pl.Warnings) > 0) != want {
+			t.Errorf("%q: %+v %v", c, pl, err)
+		}
+	}
+}
+
+func TestStdinScript(t *testing.T) {
+	p, u, d := setup(t)
+	for _, c := range []string{"sh", "python3", "sudo sh", "env sh"} {
+		argv := strings.Split(c, " ")
+		if !need(t, argv[0]) {
+			continue
+		}
+		for _, in := range []string{"x.sh", d + "/x.sh", "/dev/stdin", "/proc/self/fd/0", "nope"} {
+			if _, err := p.Plan(Request{Argv: argv, Cwd: d, User: u, Stdin: in}); !errors.Is(err, ErrRefused) {
+				t.Errorf("%s < %s: %v", c, in, err)
+			}
+		}
+	}
+	if pl, err := p.Plan(Request{Argv: []string{"cat"}, Cwd: d, User: u, Stdin: "x.sh"}); err != nil || pl.Stdin != "x.sh" {
+		t.Error(pl, err)
+	}
+	f, _ := os.Open(filepath.Join(d, "x.sh"))
+	dg, _ := sign.Hash(f)
+	f.Close()
+	if err := p.Store.Record(u.UID+1, dg); err != nil {
+		t.Fatal(err)
+	}
+	pl, err := p.Plan(Request{Argv: []string{"sh"}, Cwd: d, User: u, Stdin: "x.sh"})
+	if err != nil || !strings.HasPrefix(pl.Stdin, p.Store.Dir) || len(pl.Warnings) != 0 {
+		t.Error(pl, err)
+	}
+}

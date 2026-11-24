@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0, M1 and M2a done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; `internal/shell` (bash on a socket) is superseded. Next: M2b.
+> Status: M0, M1, M2a and M2b done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M2c.
 
 ## 0. Decisions
 
@@ -88,7 +88,7 @@ SSH is used only for login and bootstrap. The session itself runs over
 
 | Requirement | Why |
 |---|---|
-| Session server is a **root daemon**; the shell process drops to the target uid and is non-dumpable | Tested: the actor then cannot open its memory or descriptors in `/proc`. The actor can still kill it, which ends the session |
+| The shell process of each session is **root** and leads the terminal's session; programs run as the actor, and the shell touches files on a thread with the actor's file access and no capabilities | Only the parent of the jobs can do job control. Tested: the actor can neither kill, trace nor read it, and redirections cannot reach its own `/proc` files |
 | `Match Group witnesshell` → `ForceCommand witnesshell bootstrap`, `AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, no sftp subsystem | Otherwise the actor opens a plain shell or tunnels around the gate |
 | The shell never reads commands from the PTY (§4.3) | Type-ahead would run unapproved |
 | Actor uid ≠ witness uid | No self-witnessing |
@@ -165,17 +165,30 @@ draft ──Enter──▶ PENDING ──K approvals, 0 rejects──▶ APPROVE
 - The PTY input queue is flushed before each command, so leftover typing
   cannot feed it (tested; it does not race, as no keys pass while idle).
 
-**Language.** A small strict language, not a bash clone: simple commands,
-pipelines, `&&` `||` `;` `&`, redirections, quotes, variables, globs, `cd`,
-`export`, `jobs`/`fg`/`bg`/`kill`, `umask`. Anything else is refused with an
-error, never approximated. `exec` is refused. Parser: `mvdan.cc/sh/v3/syntax`.
-Its interpreter is not used: 35 of 45 sample scripts matched bash, and `kill`,
-`umask` and working `fg` are missing.
+**Language** (`internal/lang`). A small strict subset of bash: simple
+commands, pipelines, `&&` `||` `;` `&`, redirections of descriptors 0-2,
+quotes, `$NAME`, `*` and `?`, `~`. Anything else is refused with an error,
+never approximated. Supported text is tested to give the same arguments as
+bash. Stricter than bash where bash surprises:
+- an unset variable, and an unquoted one that bash would split or drop;
+- a pattern that matches nothing, a name that looks like an option, or a name
+  with hidden characters;
+- bash builtins that are not supported, even if a program has that name.
+
+Builtins: `cd export unset umask jobs fg bg kill exit`. They and plain
+assignments need a line of their own, because **all words of a line are
+expanded before approval**: in `touch x.txt; rm *.txt` the pattern does not
+include `x.txt`. `kill` takes jobs only. Parser: `mvdan.cc/sh/v3/syntax`.
 
 **What witnesses approve.** Besides the text: resolved program path, expanded
-arguments, owner, and trusted/signed status. Exactly that is executed. Words
-that cannot be known beforehand are refused: command substitution (D24) and
-process substitution (`<(...)`), which has the same problem.
+arguments, owner, trusted/signed status and warnings. Exactly that is
+executed (`internal/runner`), once; if the shell's state changed since, it is
+refused. Words that cannot be known beforehand are refused: command
+substitution (D24) and process substitution (`<(...)`).
+
+A line is abandoned when a command in it is suspended or ended by Ctrl-C. Not
+pinned down: the current directory and file arguments are paths, so what they
+point to can change between approval and use, as in any shell.
 
 ### 4.4 What may run (D18–D20, D22)
 A file is **trusted** if it, and every directory on its resolved path, is not
@@ -190,7 +203,8 @@ it must be **signed**. Loose ends that count as files to check:
   script. This can refuse a harmless line, such as `bash -c ./data`.
 - Interpreters and wrappers are recognized by name (`internal/launch`); one
   under an unknown name is not.
-- Redirections are M2b's job: `sh < mine.sh` must check the file.
+- `sh < mine.sh` is checked like `sh mine.sh`. What a pipe feeds an
+  interpreter cannot be (warning, D29).
 
 **Signed files.** The daemon hashes the file, checks the signature, and copies
 it to a root-owned store `/var/lib/witnesshell/signed/<sha256>`; the copy is
@@ -401,10 +415,11 @@ internal/proto/         CBOR message types, protocol version
 internal/transport/     QUIC server/client, cert pinning, resume tokens
 internal/bootstrap/     ssh exec, role menu, handshake line
 internal/daemon/        unix socket API, SO_PEERCRED, session registry, max_sessions
-internal/shell/         (superseded: bash on a socket; PTY code to be reused)
+internal/pty/           pseudo-terminals
 internal/lang/          parse, refuse, expand into an exact execution plan
 internal/trust/         file trust rules, signatures, signed store
-internal/launch/        root launcher, Landlock, uid switch, job control
+internal/launch/        policy, root launcher, Landlock, uid switch
+internal/runner/        the shell: prepare, run, job control, builtins
 internal/session/       joins gate + shell, VT emulator
 internal/gate/          draft editor, request state machine, votes, K-of-N, veto
 internal/view/          read-only pager and signature check (D27)
@@ -422,7 +437,7 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
 | M2a | Trust & launcher | trust rules, signed store, uid switch, Landlock, host checks; every attack in §4.5 is a VM regression test (`make vm-test`) |
 | M2b | Shell language | strict parser, expansion to exact plan, job control, Ctrl-C/Z; attack tests ported from `internal/shell`, which is then removed |
-| M2c | Local session | gate + shell + daemon; `witnesshell sign`; `view`/`checksig`; actor and witness over the **unix socket** on one host (no network yet) |
+| M2c | Local session | gate + shell + daemon; `witnesshell sign`; `view`, `checksig` in a session; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |

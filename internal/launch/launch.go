@@ -84,7 +84,7 @@ func Helper() error {
 	if err := dropTo(u); err != nil {
 		return err
 	}
-	unix.Umask(0o022)
+	unix.Umask(s.Plan.Umask)
 	// As the actor, so that the actor's own directory permissions apply.
 	if err := unix.Chdir(s.Plan.Cwd); err != nil {
 		return fmt.Errorf("%s: %w", s.Plan.Cwd, err)

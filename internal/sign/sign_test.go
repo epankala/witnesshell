@@ -121,7 +121,7 @@ func TestRefused(t *testing.T) {
 		if _, err := s.Install(strings.NewReader(c.content), c.sig, alice); !errors.Is(err, ErrNotSigned) {
 			t.Errorf("%s: err = %v", name, err)
 		}
-		for _, d := range []string{s.signedDir(), s.recordDir()} {
+		for _, d := range []string{s.signedDir(), s.recordDir(), s.tmpDir()} {
 			if e, _ := os.ReadDir(d); len(e) != 0 {
 				t.Errorf("%s: left files in %s", name, d)
 			}
@@ -138,6 +138,7 @@ func TestOnHostRecords(t *testing.T) {
 	if _, err := s.Install(strings.NewReader(script), nil, alice); !errors.Is(err, ErrNotSigned) {
 		t.Fatal("actor's own record accepted")
 	}
+	_ = s.Record(bob, d)
 	if err := s.Record(bob, d); err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +196,27 @@ func TestKeyFileStrict(t *testing.T) {
 		must(os.Symlink(f+"x", f))
 	})
 	check("no directory", false, func(s *Store, _ string) { s.Keys.Dir += "x" })
+}
+
+func TestSignersListsEveryone(t *testing.T) {
+	k, pub := key(t, "ed25519")
+	s := store(t, "bob "+pub)
+	d, _ := Hash(strings.NewReader(script))
+	for range 2 {
+		if err := s.Record(alice, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Signers(d, sig(t, k, Namespace, script))
+	if err != nil || len(got) != 2 || got[0].Name != "bob" || got[1].UID != alice {
+		t.Fatal(got, err)
+	}
+	if err := os.WriteFile(filepath.Join(s.recordDir(), d.Hex()), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Check(d, nil, alice); err == nil {
+		t.Fatal("corrupt record accepted")
+	}
 }
 
 func FuzzVerify(f *testing.F) {

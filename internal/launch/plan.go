@@ -38,7 +38,10 @@ type Request struct {
 	Argv []string
 	Cwd  string
 	Env  map[string]string // exported by the actor
-	User User
+	// Stdin is the file redirected to standard input, if any.
+	Stdin string
+	Umask int
+	User  User
 }
 
 // FileInfo describes a checked file, for witnesses.
@@ -58,8 +61,12 @@ type Plan struct {
 	Env      []string
 	Cwd      string
 	User     User
+	Umask    int
 	Landlock bool
+	// Stdin replaces Request.Stdin: a signed script's stored copy.
+	Stdin    string
 	Files    []FileInfo
+	Warnings []string // for witnesses
 }
 
 // Policy turns requests into plans. It must run as root in production, to
@@ -67,6 +74,9 @@ type Plan struct {
 type Policy struct {
 	Store *sign.Store
 }
+
+// WarnUnsigned is shown for an interpreter without a checked script (D29).
+const WarnUnsigned = "this allows unsigned code"
 
 // ErrRefused marks a command the policy does not allow.
 var ErrRefused = errors.New("refused")
@@ -117,7 +127,7 @@ func (p *Policy) Plan(r Request) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	pl := &Plan{Argv: slices.Clone(r.Argv), Env: env, Cwd: r.Cwd, User: r.User}
+	pl := &Plan{Argv: slices.Clone(r.Argv), Env: env, Cwd: r.Cwd, User: r.User, Umask: r.Umask, Stdin: r.Stdin}
 	c := &checker{p: p, r: r, pl: pl}
 
 	prog, err := lookup(r.Argv[0], r.Cwd)
@@ -132,14 +142,34 @@ func (p *Policy) Plan(r Request) (*Plan, error) {
 	if len(pl.Files) > 0 {
 		names = append(names, path.Base(pl.Files[0].Path))
 	}
+	// A script's own interpreter has a checked script: the program itself.
+	isScript := len(pl.Files) > 1
 	switch {
-	case matchAny(interpreters, names):
-		err = c.scriptArgs(names, 1)
-	case matchAny(wrappers, names):
+	case matchAny(interpreters, names) && !isScript:
+		c.interp = true
+		c.script, err = c.scriptArgs(names, 1)
+	case matchAny(wrappers, names) && !isScript:
 		err = c.wrapped()
 	}
 	if err != nil {
 		return nil, err
+	}
+	if c.interp && r.Stdin != "" {
+		// "sh < x.sh" runs x.sh.
+		file := abs(r.Stdin, r.Cwd)
+		use, f, err := c.check(r.Stdin, file)
+		if err != nil {
+			return nil, err
+		}
+		f.Close()
+		if !f.Regular() {
+			return nil, refuse("%s: an interpreter's input must be a regular file", r.Stdin)
+		}
+		pl.Stdin = use
+		c.script = true
+	}
+	if c.interp && !c.script {
+		pl.Warnings = append(pl.Warnings, WarnUnsigned)
 	}
 	pl.Landlock = !matchAny(elevators, names)
 	return pl, nil
@@ -170,9 +200,11 @@ func lookup(name, cwd string) (string, error) {
 }
 
 type checker struct {
-	p  *Policy
-	r  Request
-	pl *Plan
+	p      *Policy
+	r      Request
+	pl     *Plan
+	interp bool // an interpreter will run
+	script bool // and the script it runs was certainly checked
 }
 
 // check returns the path to use for file: itself if trusted, or the stored
@@ -330,8 +362,9 @@ func (c *checker) fileArg(i int, execOnly bool) (found bool, err error) {
 	return true, nil
 }
 
-// scriptArgs checks the script an interpreter at argv[from-1] will run.
-func (c *checker) scriptArgs(names []string, from int) error {
+// scriptArgs checks the script an interpreter at argv[from-1] will run. It
+// reports whether one was certainly found.
+func (c *checker) scriptArgs(names []string, from int) (bool, error) {
 	flags := ""
 	for _, n := range names {
 		if f, ok := flagsOnly[version.ReplaceAllString(n, "")]; ok {
@@ -349,17 +382,17 @@ func (c *checker) scriptArgs(names []string, from int) error {
 		}
 		found, err := c.fileArg(i, false)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if sure {
 			if !found && a != "-" {
 				// It could be created between this check and the start.
-				return refuse("%s: script not found", a)
+				return false, refuse("%s: script not found", a)
 			}
-			return nil
+			return found, nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // wrapped checks programs and scripts named in a wrapper's arguments.
@@ -377,9 +410,12 @@ func (c *checker) wrapped() error {
 			return err
 		}
 		if matchAny(interpreters, names) {
-			if err := c.scriptArgs(names, i+1); err != nil {
+			found, err := c.scriptArgs(names, i+1)
+			if err != nil {
 				return err
 			}
+			c.script = found && (c.script || !c.interp) // all of them
+			c.interp = true
 		}
 	}
 	return nil
@@ -393,6 +429,9 @@ var badEnv = regexp.MustCompile(`^(LD_.*|GLIBC_.*|MALLOC_.*|GCONV_PATH|LOCPATH|N
 	`PYTHON.*|PERL.*|RUBY.*|GEM_.*|BUNDLE_.*|NODE_.*|NPM_.*|LUA_.*|PHP.*|JAVA_.*|JDK_.*|_JAVA_.*|CLASSPATH|TCL.*|AWK.*|R_.*|` +
 	`GIT_.*|SSH_ASKPASS|SUDO_.*|SYSTEMD_.*|PAGER|MANPAGER|LESS.*|MORE|EDITOR|VISUAL|VIM.*|EXINIT|VIMINIT|NVIM.*|BROWSER|XDG_.*|` +
 	`TERMINFO.*|TERMCAP|MAKE.*|MFLAGS|CC|CXX|.*_PRELOAD)$`)
+
+// EnvAllowed reports whether the actor may set a variable.
+func EnvAllowed(name string) bool { return envName.MatchString(name) && !badEnv.MatchString(name) }
 
 func environment(u User, cwd string, extra map[string]string) ([]string, error) {
 	env := []string{"HOME=" + u.Home, "USER=" + u.Name, "LOGNAME=" + u.Name, "PATH=" + SearchPath, "PWD=" + cwd,

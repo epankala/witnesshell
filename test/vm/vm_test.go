@@ -55,12 +55,18 @@ func TestMain(m *testing.M) {
 		return uint32(id), err
 	}}
 	st.Keys = sign.KeyDir{Dir: sign.DefaultKeyDir}
-	must(os.RemoveAll(st.Dir))
-	must(os.RemoveAll(st.Keys.Dir))
+	isLeader := len(os.Args) > 1 && os.Args[1] == leaderArg
+	if !isLeader {
+		must(os.RemoveAll(st.Dir))
+		must(os.RemoveAll(st.Keys.Dir))
+	}
 	must(os.MkdirAll(st.Keys.Dir, 0o711))
 	must(st.Init())
 	policy = &launch.Policy{Store: st}
 	execDirs = []string{"/usr", st.Dir + "/signed"}
+	if isLeader {
+		leader()
+	}
 	os.Exit(m.Run())
 }
 
@@ -113,6 +119,7 @@ rm -f /var/lib/systemd/linger/alice`)
 
 func fixtures(t *testing.T) {
 	t.Helper()
+	sh(t, "rm -rf /var/lib/witnesshell/records/*")
 	sh(t, `cd /home/alice && rm -rf evil *.sh *.py *.sig MARK lib.so
 cp "$(readlink -f /bin/bash)" evil
 printf '#!/bin/sh\ntouch /home/alice/MARK\n' >s.sh
@@ -129,7 +136,7 @@ type result struct {
 func try(t *testing.T, stdin string, argv ...string) (r result) {
 	t.Helper()
 	_ = os.Remove(marker)
-	pl, err := policy.Plan(launch.Request{Argv: argv, Cwd: home, User: alice})
+	pl, err := policy.Plan(launch.Request{Argv: argv, Cwd: home, User: alice, Umask: 0o022})
 	if err != nil {
 		return result{planErr: err}
 	}
@@ -310,7 +317,7 @@ func TestLandlockAlone(t *testing.T) {
 	sh(t, "mount -o remount,bind,exec,nosuid,nodev /home")
 	defer harden(t)
 	c := []string{"bash", "-c", evil + " -c 'touch " + marker + "'"}
-	pl, err := policy.Plan(launch.Request{Argv: c, Cwd: home, User: alice})
+	pl, err := policy.Plan(launch.Request{Argv: c, Cwd: home, User: alice, Umask: 0o022})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,15 +360,10 @@ for f in s.sh s.py evil; do ssh-keygen -q -Y sign -f k -n witnesshell /home/alic
 	// A witness signing on the host needs no key.
 	must(os.Remove(keyFile))
 	run(false, "./s.sh")
-	f, err := os.Open(home + "/s.sh")
-	must(err)
-	d, err := sign.Hash(f)
-	must(err)
-	_ = f.Close()
-	must(policy.Store.Record(bob.UID, d))
+	signHere(t, home+"/s.sh", bob.UID)
 	run(true, "./s.sh")
 	// Changing the file between approval and start has no effect.
-	pl, err := policy.Plan(launch.Request{Argv: []string{"./s.sh"}, Cwd: home, User: alice})
+	pl, err := policy.Plan(launch.Request{Argv: []string{"./s.sh"}, Cwd: home, User: alice, Umask: 0o022})
 	must(err)
 	must(os.WriteFile(home+"/s.sh", []byte("#!/bin/sh\ntouch /home/alice/SWAPPED\n"), 0o755))
 	_ = os.Remove(marker)
@@ -374,15 +376,26 @@ for f in s.sh s.py evil; do ssh-keygen -q -Y sign -f k -n witnesshell /home/alic
 	run(false, "./s.sh")
 }
 
+// signHere records an on-host signature.
+func signHere(t *testing.T, file string, uid uint32) {
+	t.Helper()
+	f, err := os.Open(file)
+	must(err)
+	defer f.Close()
+	d, err := sign.Hash(f)
+	must(err)
+	must(policy.Store.Record(uid, d))
+}
+
 func TestStoreProtected(t *testing.T) {
 	var st unix.Stat_t
-	for _, p := range []string{"/var/lib/witnesshell", "/var/lib/witnesshell/signed", "/var/lib/witnesshell/records"} {
+	for _, p := range []string{"/var/lib/witnesshell", "/var/lib/witnesshell/signed", "/var/lib/witnesshell/records", "/var/lib/witnesshell/tmp"} {
 		must(unix.Stat(p, &st))
 		if st.Uid != 0 || st.Mode&0o022 != 0 {
 			t.Errorf("%s: uid %d mode %o", p, st.Uid, st.Mode)
 		}
 	}
-	if m, _ := filepath.Glob("/var/lib/witnesshell/records/tmp-*"); len(m) != 0 {
+	if m, _ := filepath.Glob("/var/lib/witnesshell/tmp/*"); len(m) != 0 {
 		t.Errorf("temporary files left: %v", m)
 	}
 }

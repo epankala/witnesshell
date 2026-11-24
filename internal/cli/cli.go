@@ -33,6 +33,8 @@ var commands = map[string]command{
 	"sessions":  {summary: "list active sessions on this host", milestone: "M2"},
 	"audit":     {summary: "audit tools: 'audit verify <file.log>'", milestone: "M6"},
 	"version":   {summary: "print version information", run: runVersion},
+	"checksig":  {summary: "show whether a file is trusted or signed: checksig FILE", run: runChecksig},
+	"sign":      {summary: "sign a file on this host as a witness", milestone: "M2c"},
 	"keyname":   {summary: "print the file name for a public key: keyname KEY.pub", run: runKeyname},
 	"help":      {summary: "show this help"}, // handled in Run (avoids init cycle)
 }
