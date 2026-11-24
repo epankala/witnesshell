@@ -336,7 +336,15 @@ make vm-ssh     # log in as vmadmin; VM_USER=alice for an actor
 make vm-status
 make vm-stop    # keeps the disk
 make vm-reset   # stops and discards the disk
+make vm-list    # all VMs: state, pid, ports
 ```
+
+Add `VM=name` to any of these, except `vm-list`, to use another VM beside the
+default one, for example `make vm-start VM=web`. Each gets its own disk, key,
+directory (`$VM_DIR-name`), hostname (`witnesshell-vm-name`) and ports, counted
+up from `VM_SSH_PORT` (2222) and `VM_UDP_PORT` (60001). The image is downloaded
+once. The UDP port is the same inside the VM, so set `udp_port` there to the one
+`vm-list` shows. `vm-reset` removes a named VM completely.
 
 VM accounts: `vmadmin` (root through sudo), `alice` (sudo with password `test`),
 `bob` and `carol`. Settings such as `VM_DIR` and `VM_SSH_PORT` can go in an

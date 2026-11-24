@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "launch:", launch.Helper())
 		os.Exit(126)
 	}
-	if h, _ := os.Hostname(); h != "witnesshell-vm" || os.Getuid() != 0 {
+	if h, _ := os.Hostname(); h != "witnesshell-vm" && !strings.HasPrefix(h, "witnesshell-vm-") || os.Getuid() != 0 {
 		fmt.Fprintln(os.Stderr, "run as root in the test VM only")
 		os.Exit(1)
 	}

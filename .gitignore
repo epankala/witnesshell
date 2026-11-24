@@ -1,4 +1,5 @@
 .claude/
 /dist/
 /.vm/
+/.vm-*/
 /local.mk
