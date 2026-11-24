@@ -207,6 +207,7 @@ func TestShellBasics(t *testing.T) {
 	s.expect("stty size", "24 200", 0)
 	s.expect("false", "", 1)
 	s.expect("echo rc=$?", "rc=1", 0)
+	s.refused("false; echo $?")
 	s.expect("printf 'a\\nb\\n' | grep b | tr b c", "c\r\n", 0)
 	s.expect("false && echo NO || echo yes", "yes", 0)
 	s.expect("true || echo NO; echo two", "two", 0)
@@ -243,7 +244,16 @@ func TestShellBasics(t *testing.T) {
 	s.refused("echo $(id)")
 	s.refused("eval id")
 	s.refused("exec id")
-	s.refused("cd d && rm *")
+	s.expect("cd d && echo * $PWD", "1 2 "+home+"/d", 0)
+	s.expect("cd .. && pwd && false || pwd", home+"\r\n"+home, 0)
+	s.refused("cd nope && ls")
+	s.refused("cd d; ls")
+	s.refused("cd d || ls")
+	s.refused("ls && cd d")
+	s.refused("cd d && cd ..")
+	s.refused("cd d && export A=1")
+	s.refused("cd d && ./s.sh")
+	s.refused("cd d && sh ../s.sh")
 	s.refused("X=1; echo a")
 	s.refused("X=1 cd d")
 	s.refused("cd d | cat")
@@ -424,10 +434,10 @@ func TestChecksigCommand(t *testing.T) {
 	}
 	s := shell(t)
 	s.expect("witnesshell checksig s.sh", "signed   no", 0)
-	s.expect("witnesshell checksig /usr/bin/env", "cannot modify it", 0)
+	s.expect("witnesshell checksig /usr/bin/env", "trusted  yes", 0)
 	s.expect("ls /var/lib/witnesshell/records", "denied", 2)
 	signHere(t, home+"/s.sh", bob.UID)
-	s.expect("witnesshell checksig s.sh", fmt.Sprintf(`by "uid %d"`, bob.UID), 0)
+	s.expect("witnesshell checksig s.sh", fmt.Sprintf(`by uid %d`, bob.UID), 0)
 	s.expect("./s.sh", "", 0)
 	if !exists(marker) {
 		t.Error("signed script did not run")
@@ -435,4 +445,33 @@ func TestChecksigCommand(t *testing.T) {
 	signHere(t, home+"/s.sh", alice.UID)
 	s.expect("witnesshell checksig s.sh", "does not count", 0)
 	s.expect("witnesshell checksig /root/secret", "denied", 1)
+}
+
+func TestShellView(t *testing.T) {
+	harden(t)
+	fixtures(t)
+	sh(t, "cd /home/alice && seq 1 500 >long && printf 'a\\033]0;x\\007b\\n' >esc && chown alice: long esc && install -m 600 /dev/null /root/secret")
+	s := shell(t)
+	s.expect("view esc", "a^[]0;x^Gb", 0)
+	s.expect("view /etc/hostname", "witnesshell-vm", 0)
+	s.expect("view /root/secret", "denied", 1)
+	s.expect("view /proc/self/environ", "denied", 1)
+	s.expect("view /dev/zero", "not a regular", 1)
+	s.expect("checksig s.sh", "trusted  no", 0)
+	s.expect("checksig /usr/bin/env", "trusted  yes", 0)
+	s.expect("checksig /root/secret", "denied", 1)
+	for _, c := range []string{"view esc | sh", "view esc >x", "view esc; id", "view esc && id", "view esc &", "A=1 view esc", "view $(id)"} {
+		s.refused(c)
+	}
+	s.begin("view long")
+	s.busy()
+	s.key("!touch MARK\r\x1a\x1c")
+	time.Sleep(300 * time.Millisecond)
+	s.busy()
+	s.key("Gqtouch MARK\r")
+	if r := s.end(); r.Status != 0 || !strings.Contains(s.text(), "\r\n500") {
+		t.Errorf("%+v", r)
+	}
+	clean(t)
+	s.expect("stty -a", " icanon", 0)
 }

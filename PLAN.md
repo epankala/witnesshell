@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0, M1, M2a and M2b done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M2c.
+> Status: M0, M1 and M2 (a, b, c) done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M3.
 
 ## 0. Decisions
 
@@ -175,9 +175,10 @@ bash. Stricter than bash where bash surprises:
   with hidden characters;
 - bash builtins that are not supported, even if a program has that name.
 
-Builtins: `cd export unset umask jobs fg bg kill exit`. They and plain
-assignments need a line of their own, because **all words of a line are
-expanded before approval**: in `touch x.txt; rm *.txt` the pattern does not
+Builtins: `cd export unset umask jobs fg bg kill exit view checksig`. They and
+plain assignments need a line of their own, except `cd DIR && ...` at the start
+(the directory is worked out before approval and must be the same when run), because **all words of a line are
+expanded before approval** (`$?` only at its start): in `touch x.txt; rm *.txt` the pattern does not
 include `x.txt`. `kill` takes jobs only. Parser: `mvdan.cc/sh/v3/syntax`.
 
 **What witnesses approve.** Besides the text: resolved program path, expanded
@@ -285,6 +286,26 @@ Both start no program. Rules:
 - A viewed file can change before a command uses it. The SHA-256 lets a
   witness compare; for signed files the stored copy runs (§4.4).
 
+### 4.7 Daemon and clients (M2c, on one host)
+- `witnesshell daemon` (root) listens on `/run/witnesshell.sock`. The kernel
+  says which user connects. `witnesshell attach` offers the sessions (D14).
+- One root process per session (`internal/daemon/leader.go`) runs the shell;
+  the daemon keeps gate and terminal. Messages are length-prefixed JSON.
+- **Connections from inside a session are refused**, by cgroup, so an approved
+  program cannot vote, sign or type as its user. Programs a user runs outside
+  any session can; hosts must not offer that to actors.
+- **Nothing outlives a session**: its cgroup is killed, `nohup` or not.
+  (`sudo systemd-run` escapes; root can.)
+- **Screens are drawn from a terminal emulator**, cell by cell. Programs cannot
+  paint over the approval panel or send escape sequences to anyone's terminal.
+- Witnesses must page to the end of a request, and it must have been visible
+  0.7 s, before `a` counts. That is the client's rule, against mistakes.
+- State overtakes screen output. A client that falls behind gets a fresh
+  screen; it neither delays others nor is dropped.
+- After reconnecting, the screen is rebuilt from the last 64 KB of output,
+  which may be incomplete until M5.
+- Logging out (Ctrl-D or `exit`) needs no approval.
+
 ## 5. Authorisation & config (D5, D13, D14)
 
 Any member of group `witnesshell` who logs in may witness any session they
@@ -294,8 +315,9 @@ do not own. `/etc/witnesshell/config.toml`:
 approvals_required = 1        # K
 max_sessions       = 0        # 0 = unlimited, 1 = single session on host
 detach_timeout     = "30m"    # actor gone this long → logout, queue purged, SIGHUP
-udp_port           = 60001
-record_dir         = "/var/log/witnesshell"
+udp_port           = 60001    # M4
+record_dir         = "/var/log/witnesshell"   # M6
+exec_dirs          = ["/usr"]  # where Landlock allows programs
 allow_weak_host    = false    # skip the host checks of §4.5
 ```
 
@@ -308,7 +330,7 @@ management on the host has to prevent that.
   the daemon starts. The client pins its SHA-256 hash, obtained over ssh.
 - One UDP port for all sessions; connections are routed by token.
 - Streams:
-  - control (CBOR messages, both directions: hello, draft updates,
+  - control (JSON messages, both directions: hello, draft updates,
     request/vote/result, state changes, resize, witness list)
   - terminal output (server → clients)
   - actor input (actor → server)
@@ -399,10 +421,11 @@ log. Witnesses have no recording of their own; they see the same screen.
 | Need | Library |
 |---|---|
 | QUIC + TLS | `github.com/quic-go/quic-go` |
-| VT emulation (resume screen state) | `github.com/charmbracelet/x/vt` (fallback `hinshun/vt10x`) |
+| VT emulation (resume screen state) | `github.com/charmbracelet/x/vt` |
 | Raw mode / size | `golang.org/x/term` |
 | PTY, peer creds, tcflush | `golang.org/x/sys/unix` |
-| Wire format | `github.com/fxamacker/cbor/v2` |
+| Shell parser | `mvdan.cc/sh/v3/syntax` |
+| SSH signatures | `golang.org/x/crypto/ssh` |
 | Config | `github.com/BurntSushi/toml` |
 
 Build: `CGO_ENABLED=0 GOOS=linux GOARCH={amd64,arm64} go build -trimpath -ldflags='-s -w'`.
@@ -411,7 +434,7 @@ Build: `CGO_ENABLED=0 GOOS=linux GOARCH={amd64,arm64} go build -trimpath -ldflag
 
 ```
 cmd/witnesshell/        one binary: connect | bootstrap | daemon | sessions | audit verify | version
-internal/proto/         CBOR message types, protocol version
+internal/wire/          messages, protocol version
 internal/transport/     QUIC server/client, cert pinning, resume tokens
 internal/bootstrap/     ssh exec, role menu, handshake line
 internal/daemon/        unix socket API, SO_PEERCRED, session registry, max_sessions

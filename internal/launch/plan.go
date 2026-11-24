@@ -436,6 +436,11 @@ func EnvAllowed(name string) bool { return envName.MatchString(name) && !badEnv.
 func environment(u User, cwd string, extra map[string]string) ([]string, error) {
 	env := []string{"HOME=" + u.Home, "USER=" + u.Name, "LOGNAME=" + u.Name, "PATH=" + SearchPath, "PWD=" + cwd,
 		"PYTHONSAFEPATH=1"} // do not import modules from the current directory
+	for _, d := range [][2]string{{"TERM", "xterm-256color"}, {"LANG", "C.UTF-8"}} {
+		if _, ok := extra[d[0]]; !ok {
+			env = append(env, d[0]+"="+d[1])
+		}
+	}
 	names := make([]string, 0, len(extra))
 	for n := range extra {
 		names = append(names, n)

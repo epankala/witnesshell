@@ -21,6 +21,7 @@ import (
 
 	"witnesshell/internal/lang"
 	"witnesshell/internal/launch"
+	"witnesshell/internal/view"
 )
 
 var (
@@ -136,11 +137,37 @@ func (s *Shell) Var(n string) (string, bool) {
 
 func (s *Shell) Home() string { return s.c.User.Home }
 
-func (s *Shell) ReadDir(dir string) ([]lang.DirEntry, error) {
+func (s *Shell) ReadDir(dir string) ([]lang.DirEntry, error) { return s.readDir(s.dir, dir) }
+
+// Chdir implements lang.Chdirer.
+func (s *Shell) Chdir(args []string) (lang.Env, error) {
+	to, err := s.cdTarget(args)
+	if err != nil {
+		return nil, fmt.Errorf("cd: %w", err)
+	}
+	return dirEnv{s, to}, nil
+}
+
+// dirEnv is the shell's environment as it will be after a cd.
+type dirEnv struct {
+	s   *Shell
+	dir string
+}
+
+func (e dirEnv) Home() string { return e.s.Home() }
+func (e dirEnv) Var(n string) (string, bool) {
+	if n == "PWD" {
+		return e.dir, true
+	}
+	return e.s.Var(n)
+}
+func (e dirEnv) ReadDir(dir string) ([]lang.DirEntry, error) { return e.s.readDir(e.dir, dir) }
+
+func (s *Shell) readDir(base, dir string) ([]lang.DirEntry, error) {
 	if dir == "" {
 		dir = "."
 	}
-	f, err := launch.OpenAs(s.c.User, s.dir, dir, unix.O_RDONLY|unix.O_DIRECTORY)
+	f, err := launch.OpenAs(s.c.User, base, dir, unix.O_RDONLY|unix.O_DIRECTORY)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +181,7 @@ func (s *Shell) ReadDir(dir string) ([]lang.DirEntry, error) {
 	for _, e := range es {
 		d := e.IsDir()
 		if e.Type()&os.ModeSymlink != 0 {
-			if t, err := launch.OpenAs(s.c.User, s.dir, dir+"/"+e.Name(), unix.O_PATH|unix.O_DIRECTORY); err == nil {
+			if t, err := launch.OpenAs(s.c.User, base, dir+"/"+e.Name(), unix.O_PATH|unix.O_DIRECTORY); err == nil {
 				d = true
 				_ = t.Close()
 			}
@@ -170,11 +197,83 @@ type Prepared struct {
 	Steps   []Step
 	builtin []string // set instead of Steps
 	assigns []lang.Assign
+	cdTo    string // set for "cd DIR && ...": where Steps run
+	cdArgs  []string
 	gen     uint64
 }
 
 // Builtin returns a shell builtin's words, if that is what the line is.
 func (p *Prepared) Builtin() []string { return p.builtin }
+
+// Free reports whether the line needs no approval.
+func (p *Prepared) Free() bool {
+	return p.builtin != nil && (p.builtin[0] == "view" || p.builtin[0] == "checksig" || p.builtin[0] == "exit")
+}
+
+// Describe tells witnesses exactly what will run. All text is safe to print.
+func (p *Prepared) Describe() []string {
+	if p.builtin != nil {
+		return []string{"shell builtin: " + words(p.builtin)}
+	}
+	var out []string
+	for _, a := range p.assigns {
+		out = append(out, fmt.Sprintf("set variable %s=%q", a.Name, a.Value))
+	}
+	if p.cdTo != "" {
+		out = append(out, fmt.Sprintf("change directory to %q, then:", p.cdTo))
+	}
+	for i, st := range p.Steps {
+		if i > 0 || st.Op != lang.Always {
+			out = append(out, [...]string{"then:", "if that succeeded:", "if that failed:"}[st.Op])
+		}
+		for j, c := range st.Cmds {
+			pre := "run "
+			if j > 0 {
+				pre = "  piped into "
+			}
+			out = append(out, fmt.Sprintf("%s%q", pre, c.Plan.Path), "  arguments: "+words(c.Plan.Argv))
+			for _, e := range c.Env {
+				out = append(out, fmt.Sprintf("  with variable %q", e))
+			}
+			for _, r := range c.Redirs {
+				switch r.Kind {
+				case lang.Read:
+					out = append(out, fmt.Sprintf("  input from %q", c.Plan.Stdin))
+				case lang.Write:
+					out = append(out, fmt.Sprintf("  output %d OVERWRITES %q", r.FD, r.Path))
+				case lang.Append:
+					out = append(out, fmt.Sprintf("  output %d added to %q", r.FD, r.Path))
+				case lang.Dup:
+					out = append(out, fmt.Sprintf("  output %d to the same place as %d", r.FD, r.Source))
+				}
+			}
+			for _, f := range c.Plan.Files {
+				how := fmt.Sprintf("trusted, owner uid %d", f.OwnerUID)
+				if !f.Trusted {
+					how = fmt.Sprintf("signed by %s, sha256 %s", strings.Join(f.SignedBy, ", "), f.SHA256)
+				}
+				out = append(out, fmt.Sprintf("  file %q: %s", f.Path, how))
+			}
+			if c.Plan.Landlock {
+				out = append(out, fmt.Sprintf("  in %q", c.Plan.Cwd))
+			} else {
+				out = append(out, fmt.Sprintf("  in %q, without Landlock", c.Plan.Cwd))
+			}
+		}
+		if st.Background {
+			out = append(out, "  in the background")
+		}
+	}
+	return out
+}
+
+func words(argv []string) string {
+	q := make([]string, len(argv))
+	for i, a := range argv {
+		q[i] = strconv.Quote(a)
+	}
+	return strings.Join(q, " ")
+}
 
 // Step is one pipeline.
 type Step struct {
@@ -187,6 +286,7 @@ type Step struct {
 type Cmd struct {
 	Plan   *launch.Plan
 	Redirs []lang.Redir
+	Env    []string // variables set just for this command
 }
 
 // Warnings returns all warnings for witnesses.
@@ -209,6 +309,7 @@ func (p *Prepared) Warnings() []string {
 var builtins = map[string]func(s *Shell, args []string) (int, error){
 	"cd": (*Shell).cd, "export": (*Shell).export, "unset": (*Shell).unset, "umask": (*Shell).setUmask,
 	"jobs": (*Shell).listJobs, "fg": (*Shell).fg, "bg": (*Shell).bg, "kill": (*Shell).kill, "exit": (*Shell).exit,
+	"view": (*Shell).view, "checksig": (*Shell).checksig,
 }
 
 // Names that bash would treat as builtins. The program of the same name, if
@@ -234,10 +335,19 @@ func (s *Shell) Prepare(text string) (*Prepared, error) {
 	if len(line) == 0 {
 		return nil, errors.New("nothing to run")
 	}
+	dir := s.dir
+	if len(line) > 1 && lang.IsCd(line[0]) && line[1].Op == lang.And {
+		p.cdArgs = line[0].Cmds[0].Argv[1:]
+		if p.cdTo, err = s.cdTarget(p.cdArgs); err != nil {
+			return nil, fmt.Errorf("cd: %w", err)
+		}
+		dir, line = p.cdTo, line[1:]
+		line[0].Op = lang.Always
+	}
 	for _, pl := range line {
 		st := Step{Op: pl.Op, Background: pl.Background}
 		for _, c := range pl.Cmds {
-			alone := len(line) == 1 && len(pl.Cmds) == 1 && !pl.Background && len(c.Redirs) == 0
+			alone := p.cdTo == "" && len(line) == 1 && len(pl.Cmds) == 1 && !pl.Background && len(c.Redirs) == 0
 			if len(c.Argv) == 0 {
 				if !alone {
 					return nil, errors.New("an assignment needs a line of its own")
@@ -277,7 +387,7 @@ func (s *Shell) Prepare(text string) (*Prepared, error) {
 			for _, a := range c.Assigns {
 				env[a.Name] = a.Value
 			}
-			req := launch.Request{Argv: c.Argv, Cwd: s.dir, Env: env, User: s.c.User, Umask: s.umask}
+			req := launch.Request{Argv: c.Argv, Cwd: dir, Env: env, User: s.c.User, Umask: s.umask}
 			for _, r := range c.Redirs {
 				if r.Kind == lang.Read {
 					if req.Stdin != "" {
@@ -290,7 +400,11 @@ func (s *Shell) Prepare(text string) (*Prepared, error) {
 			if err != nil {
 				return nil, err
 			}
-			st.Cmds = append(st.Cmds, Cmd{plan, c.Redirs})
+			cmd := Cmd{Plan: plan, Redirs: c.Redirs}
+			for _, a := range c.Assigns {
+				cmd.Env = append(cmd.Env, a.Name+"="+a.Value)
+			}
+			st.Cmds = append(st.Cmds, cmd)
 		}
 		p.Steps = append(p.Steps, st)
 	}
@@ -325,6 +439,15 @@ func (s *Shell) Run(p *Prepared) (int, error) {
 		}
 		s.status = st
 		return st, nil
+	}
+	if p.cdTo != "" {
+		// The directory must still be the one that was approved.
+		if to, err := s.cdTarget(p.cdArgs); err != nil || to != p.cdTo {
+			fmt.Fprintf(s.out(), "cd: the directory changed after approval\n")
+			s.status = 1
+			return 1, nil
+		}
+		s.dir, s.status = p.cdTo, 0
 	}
 	for _, st := range p.Steps {
 		if st.Op == lang.And && s.status != 0 || st.Op == lang.Or && s.status == 0 {
@@ -585,22 +708,62 @@ func (s *Shell) resolveDir(dir string) (string, error) {
 	return out, err
 }
 
-func (s *Shell) cd(args []string) (int, error) {
+func (s *Shell) cdTarget(args []string) (string, error) {
 	if len(args) > 1 {
-		return 1, errors.New("too many arguments")
+		return "", errors.New("too many arguments")
 	}
 	to := s.c.User.Home
 	if len(args) == 1 {
 		to = args[0]
 	}
 	if to == "" || strings.HasPrefix(to, "-") {
-		return 1, errors.New("want a directory")
+		return "", errors.New("want a directory")
 	}
-	d, err := s.resolveDir(to)
+	return s.resolveDir(to)
+}
+
+func (s *Shell) cd(args []string) (int, error) {
+	d, err := s.cdTarget(args)
 	if err != nil {
 		return 1, err
 	}
 	s.dir = d
+	return 0, nil
+}
+
+// view pages a file. The keys come from the terminal.
+func (s *Shell) view(args []string) (int, error) {
+	if len(args) != 1 {
+		return 1, errors.New("want one file")
+	}
+	d, err := view.Load(s.c.User, s.dir, args[0])
+	if err != nil {
+		return 1, err
+	}
+	fd := int(s.c.TTY.Fd())
+	ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
+	if err != nil {
+		return 1, err
+	}
+	raw := *s.termios
+	raw.Iflag &^= unix.ICRNL | unix.IXON
+	raw.Lflag &^= unix.ICANON | unix.ECHO | unix.ISIG | unix.IEXTEN
+	raw.Cc[unix.VMIN], raw.Cc[unix.VTIME] = 1, 0
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &raw); err != nil {
+		return 1, err
+	}
+	defer func() { _ = unix.IoctlSetTermios(fd, unix.TCSETSF, s.termios) }()
+	view.Run(d, s.c.TTY, s.out(), max(4, int(ws.Row)), max(10, int(ws.Col)))
+	return 0, nil
+}
+
+func (s *Shell) checksig(args []string) (int, error) {
+	if len(args) != 1 {
+		return 1, errors.New("want one file")
+	}
+	if err := view.Checksig(s.out(), s.c.User, s.dir, args[0], s.c.Policy.Store, s.c.User); err != nil {
+		return 1, err
+	}
 	return 0, nil
 }
 

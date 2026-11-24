@@ -22,6 +22,12 @@ type Env interface {
 	ReadDir(dir string) ([]DirEntry, error)
 }
 
+// Chdirer is an Env that allows "cd DIR && ...": the rest of the line is
+// expanded in the Env that Chdir returns.
+type Chdirer interface {
+	Chdir(args []string) (Env, error)
+}
+
 // DirEntry is one name found by ReadDir.
 type DirEntry struct {
 	Name string
@@ -89,7 +95,7 @@ func Parse(text string, env Env) (Line, error) {
 	if err != nil {
 		return nil, errf("syntax error: %s", strings.TrimPrefix(err.Error(), ":"))
 	}
-	p := parser{env}
+	p := &parser{env: env}
 	var out Line
 	for _, s := range f.Stmts {
 		l, err := p.list(s)
@@ -101,9 +107,12 @@ func Parse(text string, env Env) (Line, error) {
 	return out, nil
 }
 
-type parser struct{ env Env }
+type parser struct {
+	env  Env
+	done int // pipelines expanded so far
+}
 
-func (p parser) plain(s *syntax.Stmt) error {
+func (p *parser) plain(s *syntax.Stmt) error {
 	switch {
 	case s.Negated:
 		return errf("'!' is not supported")
@@ -114,7 +123,7 @@ func (p parser) plain(s *syntax.Stmt) error {
 }
 
 // list flattens && and ||, which are left-associative with equal precedence.
-func (p parser) list(s *syntax.Stmt) (Line, error) {
+func (p *parser) list(s *syntax.Stmt) (Line, error) {
 	if err := p.plain(s); err != nil {
 		return nil, err
 	}
@@ -128,6 +137,11 @@ func (p parser) list(s *syntax.Stmt) (Line, error) {
 		x, err := p.list(b.X)
 		if err != nil {
 			return nil, err
+		}
+		if c, ok := p.env.(Chdirer); ok && b.Op == syntax.AndStmt && p.done == 1 && IsCd(x[0]) {
+			if p.env, err = c.Chdir(x[0].Cmds[0].Argv[1:]); err != nil {
+				return nil, err
+			}
 		}
 		y, err := p.list(b.Y)
 		if err != nil {
@@ -146,10 +160,17 @@ func (p parser) list(s *syntax.Stmt) (Line, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.done++
 	return Line{{Cmds: cmds, Background: s.Background}}, nil
 }
 
-func (p parser) pipeline(s *syntax.Stmt) ([]Command, error) {
+// IsCd reports whether a pipeline is a plain cd.
+func IsCd(p Pipeline) bool {
+	return len(p.Cmds) == 1 && !p.Background && len(p.Cmds[0].Argv) > 0 && p.Cmds[0].Argv[0] == "cd" &&
+		len(p.Cmds[0].Assigns) == 0 && len(p.Cmds[0].Redirs) == 0
+}
+
+func (p *parser) pipeline(s *syntax.Stmt) ([]Command, error) {
 	if err := p.plain(s); err != nil {
 		return nil, err
 	}
@@ -181,7 +202,7 @@ func (p parser) pipeline(s *syntax.Stmt) ([]Command, error) {
 	return append(x, y...), nil
 }
 
-func (p parser) command(s *syntax.Stmt) (c Command, err error) {
+func (p *parser) command(s *syntax.Stmt) (c Command, err error) {
 	switch n := s.Cmd.(type) {
 	case nil:
 		return c, errf("a redirection needs a command")
@@ -263,7 +284,7 @@ func describe(n syntax.Node) string {
 	return strings.TrimPrefix(fmt.Sprintf("%T", n), "*syntax.")
 }
 
-func (p parser) assign(a *syntax.Assign) (Assign, error) {
+func (p *parser) assign(a *syntax.Assign) (Assign, error) {
 	if a.Append || a.Naked || a.Index != nil || a.Array != nil || a.Name == nil {
 		return Assign{}, errf("only NAME=value assignments are supported")
 	}
@@ -286,7 +307,7 @@ func (p parser) assign(a *syntax.Assign) (Assign, error) {
 	return out, nil
 }
 
-func (p parser) redirect(r *syntax.Redirect) ([]Redir, error) {
+func (p *parser) redirect(r *syntax.Redirect) ([]Redir, error) {
 	if r.Hdoc != nil {
 		return nil, errf("here-documents are not supported")
 	}
@@ -351,7 +372,7 @@ type char struct {
 }
 
 // expand resolves quotes and variables.
-func (p parser) expand(w *syntax.Word) ([]char, error) {
+func (p *parser) expand(w *syntax.Word) ([]char, error) {
 	var out []char
 	quoted := func(s string) {
 		for _, r := range s {
@@ -429,7 +450,7 @@ func unescapeDouble(s string) string {
 	return b.String()
 }
 
-func (p parser) param(n *syntax.ParamExp) (string, error) {
+func (p *parser) param(n *syntax.ParamExp) (string, error) {
 	// Only $name and ${name}: every other field must be unset.
 	rest := *n
 	rest.Dollar, rest.Rbrace, rest.Short, rest.Param = syntax.Pos{}, syntax.Pos{}, false, nil
@@ -440,6 +461,9 @@ func (p parser) param(n *syntax.ParamExp) (string, error) {
 	if name != "?" && !syntax.ValidName(name) {
 		return "", errf("$%s is not supported", name)
 	}
+	if name == "?" && p.done > 0 {
+		return "", errf("$? is only known at the start of a line")
+	}
 	v, ok := p.env.Var(name)
 	if !ok {
 		return "", errf("variable %s is not set", name)
@@ -448,7 +472,7 @@ func (p parser) param(n *syntax.ParamExp) (string, error) {
 }
 
 // word expands to one or more fields.
-func (p parser) word(w *syntax.Word) ([]string, error) {
+func (p *parser) word(w *syntax.Word) ([]string, error) {
 	t, err := p.expand(w)
 	if err != nil {
 		return nil, err
@@ -507,7 +531,7 @@ func plainText(t []char) string {
 // maxGlob bounds how many names a pattern may produce.
 const maxGlob = 4096
 
-func (p parser) glob(t []char) ([]string, error) {
+func (p *parser) glob(t []char) ([]string, error) {
 	text := plainText(t)
 	var comps [][]char
 	start := 0
@@ -586,7 +610,7 @@ func (p parser) glob(t []char) ([]string, error) {
 }
 
 // existing keeps the paths that exist.
-func (p parser) existing(paths []string, last bool) ([]string, error) {
+func (p *parser) existing(paths []string, last bool) ([]string, error) {
 	var out []string
 	for _, f := range paths {
 		trimmed := strings.TrimSuffix(f, "/")

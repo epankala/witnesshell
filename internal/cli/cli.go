@@ -29,12 +29,13 @@ type command struct {
 var commands = map[string]command{
 	"connect":   {summary: "connect to user@host as actor or witness (runs ssh, then QUIC)", milestone: "M3/M4"},
 	"bootstrap": {summary: "remote side of connect; started by sshd ForceCommand", milestone: "M3"},
-	"daemon":    {summary: "run the session daemon (root, systemd)", milestone: "M2"},
-	"sessions":  {summary: "list active sessions on this host", milestone: "M2"},
+	"daemon":    {summary: "run the session daemon (root)", run: runDaemon},
+	"attach":    {summary: "on this host: start, reattach to or witness a session", run: runAttach},
+	"sessions":  {summary: "list active sessions on this host", run: runSessions},
 	"audit":     {summary: "audit tools: 'audit verify <file.log>'", milestone: "M6"},
 	"version":   {summary: "print version information", run: runVersion},
 	"checksig":  {summary: "show whether a file is trusted or signed: checksig FILE", run: runChecksig},
-	"sign":      {summary: "sign a file on this host as a witness", milestone: "M2c"},
+	"sign":      {summary: "sign a file on this host as a witness: sign [-sha256 HASH] FILE", run: runSign},
 	"keyname":   {summary: "print the file name for a public key: keyname KEY.pub", run: runKeyname},
 	"help":      {summary: "show this help"}, // handled in Run (avoids init cycle)
 }

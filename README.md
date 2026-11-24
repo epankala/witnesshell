@@ -12,10 +12,10 @@ contractor access, four-eyes rules, and privileged work that must be reviewable
 afterwards.
 
 > [!WARNING]
-> **Under development and not usable yet.** The core parts exist and are
-> tested, but there is no daemon, approval screen or network connection. This
-> page describes the intended whole; parts not built yet are marked *planned*
-> or listed under [Status](#status). Do not rely on it for security.
+> **Under development.** It works on a single host: a daemon, an actor and
+> witnesses in separate terminals. There is no network connection, no forced
+> login and no audit log yet. This page describes the intended whole; parts not
+> built yet are marked *planned*. Do not rely on it for security.
 
 ## Contents
 
@@ -28,6 +28,7 @@ afterwards.
 [Limits](#what-it-does-not-protect-against) ·
 [Logging](#logging-and-recording) ·
 [Status](#status) ·
+[Trying it](#trying-it) ·
 [Building](#building) ·
 [Testing](#testing)
 
@@ -53,7 +54,6 @@ afterwards.
    run yet**.
 4. Witnesses see the line, the full program path, the final arguments, the
    file's owner, whether it is trusted or signed, and any warnings.
-   *(screens planned)*
 5. Once enough witnesses approve, exactly that is executed, once.
 
 ## Witnessing
@@ -69,13 +69,17 @@ afterwards.
 - **No witness, no execution.** A command waits, one at a time. When the actor
   logs out, or has been disconnected for 30 minutes, it is dropped.
 - **Any user of the host may witness.** Witnesses watch the terminal live,
-  including full-screen programs, but can never type into it. *(planned)*
+  including full-screen programs, but can never type into it.
+- **No spoofing.** Screens are drawn from a terminal emulator, so a program can
+  neither paint a fake approval panel nor send commands to a terminal.
+- **No voting by programs.** Connections from inside a session are refused.
+- **Read before approving.** Long requests must be paged to the end.
 - **No hidden text.** Control, invisible and text-direction characters are
   refused, so a command does not look different from what it does.
 - **While an approved program runs, the actor may type into it freely.**
   Witnesses watch. Approval is required again when it exits or is suspended.
 
-Actor and witnesses can look at files (`view`, *planned*) and check signatures
+Actor and witnesses can look at files (`view`) and check signatures
 (`checksig`) **without approval**, with their own file permissions. Neither
 starts another program.
 
@@ -113,7 +117,8 @@ ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n witnesshell deploy.sh
 # copy deploy.sh and deploy.sh.sig to the host, side by side
 ```
 
-**On the host** *(planned)*: `witnesshell sign deploy.sh`. No private key is
+**On the host**: `witnesshell sign deploy.sh`, or `S` while viewing a file as a
+witness. No private key is
 involved; the daemon records which logged-in user signed which content.
 
 Check a file:
@@ -167,8 +172,8 @@ program runs is discarded before the next command.
 
 ### Host requirements
 
-Checked by `internal/hostcheck`. The daemon will refuse to start without them
-unless `allow_weak_host` is set.
+Checked when a session starts. Without them the daemon refuses, unless
+`allow_weak_host` is set; then everyone sees `WEAK HOST`.
 
 - Linux with Landlock active
 - `kernel.yama.ptrace_scope` ≥ 1 and `vm.memfd_noexec` = 2
@@ -186,13 +191,15 @@ refused rather than guessed.**
 | commands, pipes, `&&` `\|\|` `;` `&` | `$(...)`, backticks, `<(...)` |
 | `>` `>>` `<` `2>` `2>&1` `&>` | here-documents, descriptors above 2 |
 | `$NAME`, `$?`, quotes, `~`, `*`, `?` | `${x:-y}`, arithmetic, `{a,b}`, `[a-z]` |
-| `cd export unset umask exit` | functions, aliases, `if`, `for`, `while` |
+| `cd export unset umask exit view checksig` | functions, aliases, `if`, `for`, `while` |
 | `jobs fg bg kill`, Ctrl-C, Ctrl-Z | `exec`, `eval`, `source` |
 
 - Everything is expanded **before** approval, so witnesses see the final
   arguments. In `touch x.txt; rm *.txt` the pattern does not include a newly
   created `x.txt`.
-- `cd`, `export` and assignments need a line of their own.
+- `cd`, `export` and assignments need a line of their own, except
+  `cd DIR && command`.
+- Programs end with the session, even with `nohup`.
 - Unset variables, and patterns that match nothing or match a name that looks
   like an option, are errors.
 - No tab completion.
@@ -239,15 +246,45 @@ secrets included.
 | Trust rules, SSH signatures, `checksig`, `keyname` | ✅ done |
 | Restricted launcher, host checks | ✅ done |
 | Shell language and job control | ✅ done |
-| Daemon, approval screens, `view`, on-host `sign` | 🚧 next |
-| SSH login and role selection | planned |
+| Daemon, approval screens, `view`, on-host `sign` | ✅ done, one host only |
+| Forced SSH login | 🚧 next |
 | QUIC transport and reconnecting | planned |
 | Audit logs and recording | planned |
 | Hardening, packaging, releases | planned |
 
-"Done" means built and tested on its own; the parts are not connected yet. The
-design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
+The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
 audited by a third party.
+
+## Trying it
+
+Use the [test VM](#testing), not a machine you care about. As root:
+
+```sh
+witnesshell daemon        # needs the host requirements, or allow_weak_host
+```
+
+Then, as two different users in two terminals:
+
+```sh
+witnesshell attach        # the actor starts a session; a witness picks it
+```
+
+| Actor | Witness |
+|---|---|
+| Enter: submit | `a` approve, `r` reject |
+| Ctrl-C: cancel | Space, `b`: scroll |
+| Ctrl-D: log out | `v` view file, `s` check signature |
+| Ctrl-]: detach | `q` leave |
+
+Configuration, all optional, in `/etc/witnesshell/config.toml`:
+
+```toml
+approvals_required = 1
+max_sessions       = 0          # no limit
+detach_timeout     = "30m"
+exec_dirs          = ["/usr"]
+allow_weak_host    = false
+```
 
 ## Building
 

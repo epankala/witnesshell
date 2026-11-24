@@ -142,6 +142,23 @@ func TestActorCannotVote(t *testing.T) {
 	state(t, g, Pending)
 }
 
+func TestSubmitFree(t *testing.T) {
+	g := newGate(t, 2)
+	ok(t, g.Insert("view x"))
+	s, err := g.SubmitFree()
+	ok(t, err)
+	if s != "view x" {
+		t.Fatal(s)
+	}
+	state(t, g, Running)
+	_, err = g.SubmitFree()
+	is(t, err, ErrRunning)
+	ok(t, g.Finished())
+	submit(t, g, "x")
+	_, err = g.SubmitFree()
+	is(t, err, ErrPending)
+}
+
 func TestCancel(t *testing.T) {
 	g := newGate(t, 1)
 	_, err := g.Cancel()

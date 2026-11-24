@@ -122,6 +122,9 @@ func New(actorUID uint32, required int) (*Gate, error) {
 // State returns the current state.
 func (g *Gate) State() State { return g.state }
 
+// Required returns K, the number of approvals needed.
+func (g *Gate) Required() int { return g.required }
+
 // InputFree reports whether actor input may bypass the gate.
 func (g *Gate) InputFree() bool { return g.state == Running }
 
@@ -176,6 +179,19 @@ func (g *Gate) Submit() (Request, error) {
 	g.draft = draft{}
 	g.state = Pending
 	return g.snapshot(), nil
+}
+
+// SubmitFree takes the draft without approval (D27). The caller must have
+// made sure that the text is such a command.
+func (g *Gate) SubmitFree() (string, error) {
+	if err := g.atPrompt(); err != nil {
+		return "", err
+	}
+	text := g.draft.String()
+	g.history = append(g.history, text)
+	g.draft = draft{}
+	g.state = Running
+	return text, nil
 }
 
 // Approve records an approval of request id. When the result's Outcome is

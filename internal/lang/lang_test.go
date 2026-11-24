@@ -94,7 +94,7 @@ func TestRefused(t *testing.T) {
 		"(a)", "{ a; }", "if a; then b; fi", "while a; do b; done", "for x in a; do b; done", "case a in b) c;; esac", "f() { a; }",
 		"[[ a ]]", "! a", "a |& b", "a & && b", "a && b &", "time a", "coproc a", "declare x=1", "local x", "readonly x=1", "typeset x", "nameref x=y",
 		"a <<E\nx\nE", "a <<<x", "a <>x", "a >|x", "a 3>x", "a 9<x", "a >&3", "a >&x", "a <&0", "a {fd}>x", "a >&-", "a > *.txt", "> x", "a 0>x", "a 1<x", `a > ""`,
-		"a ${A:-x}", "a ${#A}", "a ${A%x}", "a ${!A}", "a ${A[0]}", "a ${A/x/y}", "a ${A^^}", "a ${A@Q}", "a $1", "a $@", "a $*", "a $$", "a $!", "a $#", "a $-", "a $0",
+		"a ${A:-x}", "a; b $?", "a && b \"$?\"", "a || b $?", "a ${#A}", "a ${A%x}", "a ${!A}", "a ${A[0]}", "a ${A/x/y}", "a ${A^^}", "a ${A@Q}", "a $1", "a $@", "a $*", "a $$", "a $!", "a $#", "a $-", "a $0",
 		"a $S", "a $E", "a $G", "a $B", "a $NOPE", `a "$NOPE"`, "$E", "*.txt x", "a $'x'", `a $"x"`,
 		"a nope*", "a [ab].txt", "a {a,b}", "a {1..3}", "a x{", "a ~root", "a **/x[1]", "a @(x|y)", "a +(x)", "a */../x", "a */.",
 		"x+=1", "x=(1 2)", "x[0]=1", "x=~", "x=a:~/b", "export x=(1)", "export -n x", "export x+=1", "a 'unclosed", "a \"x", "a |", "a &&", "| a", "a ;; b", "if", "a \\",
