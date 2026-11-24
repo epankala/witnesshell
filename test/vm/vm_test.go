@@ -54,7 +54,10 @@ func TestMain(m *testing.M) {
 		id, err := strconv.ParseUint(u.Uid, 10, 32)
 		return uint32(id), err
 	}}
+	st.Keys = sign.KeyDir{Dir: sign.DefaultKeyDir}
 	must(os.RemoveAll(st.Dir))
+	must(os.RemoveAll(st.Keys.Dir))
+	must(os.MkdirAll(st.Keys.Dir, 0o711))
 	must(st.Init())
 	policy = &launch.Policy{Store: st}
 	execDirs = []string{"/usr", st.Dir + "/signed"}
@@ -327,11 +330,11 @@ func TestSigned(t *testing.T) {
 for f in s.sh s.py evil; do ssh-keygen -q -Y sign -f k -n witnesshell /home/alice/$f 2>/dev/null; done; chown alice: /home/alice/*.sig`)
 	pub, err := os.ReadFile("/root/k.pub")
 	must(err)
-	set := func(who string) {
-		policy.Store.Signers, err = sign.ParseSigners(strings.NewReader(who + " " + string(pub)))
-		must(err)
-	}
-	defer func() { policy.Store.Signers = nil }()
+	keyName, err := sign.PublicKeyName(pub)
+	must(err)
+	keyFile := filepath.Join(sign.DefaultKeyDir, keyName)
+	set := func(who string) { must(os.WriteFile(keyFile, []byte(who+" "+string(pub)), 0o644)) }
+	defer os.Remove(keyFile)
 	run := func(want bool, argv ...string) {
 		t.Helper()
 		if r := try(t, "", argv...); r.ran != want {
@@ -348,7 +351,7 @@ for f in s.sh s.py evil; do ssh-keygen -q -Y sign -f k -n witnesshell /home/alic
 		run(true, c...)
 	}
 	// A witness signing on the host needs no key.
-	policy.Store.Signers = nil
+	must(os.Remove(keyFile))
 	run(false, "./s.sh")
 	f, err := os.Open(home + "/s.sh")
 	must(err)
@@ -381,5 +384,20 @@ func TestStoreProtected(t *testing.T) {
 	}
 	if m, _ := filepath.Glob("/var/lib/witnesshell/records/tmp-*"); len(m) != 0 {
 		t.Errorf("temporary files left: %v", m)
+	}
+}
+
+func TestKeyDirNotListable(t *testing.T) {
+	harden(t)
+	k := sign.DefaultKeyDir
+	must(os.WriteFile(k+"/known", []byte("x"), 0o644))
+	defer os.Remove(k + "/known")
+	if r := try(t, "", "bash", "-c", "cat "+k+"/known && touch "+marker); !r.ran {
+		t.Errorf("known key not readable: %s", r.out)
+	}
+	for _, c := range []string{"ls " + k, "touch " + k + "/new", "echo x >" + k + "/known", "rm -f " + k + "/known", "mv " + k + " /tmp/k"} {
+		if r := try(t, "", "bash", "-c", c+" && touch "+marker); r.ran {
+			t.Errorf("%q succeeded", c)
+		}
 	}
 }

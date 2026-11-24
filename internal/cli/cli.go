@@ -4,9 +4,11 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 
+	"witnesshell/internal/sign"
 	"witnesshell/internal/version"
 )
 
@@ -31,6 +33,7 @@ var commands = map[string]command{
 	"sessions":  {summary: "list active sessions on this host", milestone: "M2"},
 	"audit":     {summary: "audit tools: 'audit verify <file.log>'", milestone: "M6"},
 	"version":   {summary: "print version information", run: runVersion},
+	"keyname":   {summary: "print the file name for a public key: keyname KEY.pub", run: runKeyname},
 	"help":      {summary: "show this help"}, // handled in Run (avoids init cycle)
 }
 
@@ -62,6 +65,24 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return ExitNotImplemented
 	}
 	return cmd.run(args[1:], stdout, stderr)
+}
+
+func runKeyname(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "usage: witnesshell keyname KEY.pub")
+		return ExitUsage
+	}
+	b, err := os.ReadFile(args[0])
+	var name string
+	if err == nil {
+		name, err = sign.PublicKeyName(b)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "witnesshell keyname:", err)
+		return ExitError
+	}
+	fmt.Fprintln(stdout, name)
+	return ExitOK
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) int {

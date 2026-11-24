@@ -36,6 +36,7 @@
 | D27 | Actor **and** witnesses can view files and check a file's signature with built-in commands, **without approval** (§4.6) |
 | D28 | **Separate logs** for the actor and each witness: `witnesshell-<session start>-actor-<name>` and `witnesshell-<same session start>-witness-<name>` (§8) |
 | D29 | A request that starts an interpreter without a checked script file (`python3`, `sh`, `bash -c ...`), also behind `sudo` and similar, shows witnesses the warning **"this allows unsigned code"** |
+| D30 | Initially, users' public keys are root-owned files in `/etc/witnesshell/public_keys/`. The directory **cannot be listed** (0711); the file name follows from the signature |
 
 ## 1. Goal
 
@@ -195,8 +196,12 @@ it must be **signed**. Loose ends that count as files to check:
 it to a root-owned store `/var/lib/witnesshell/signed/<sha256>`; the copy is
 what runs, so a later edit has no effect. Two ways to sign:
 - *Off the host:* an SSH signature (`ssh-keygen -Y sign -n witnesshell`),
-  checked against root-owned `/etc/witnesshell/allowed_signers`. Never against
-  `~/.ssh`, which users can edit.
+  checked against `/etc/witnesshell/public_keys/` (D30), never against
+  `~/.ssh`, which users can edit. An SSH signature holds the signer's public
+  key but no name, so a key's file is named by the SHA-256 of that key:
+  `witnesshell keyname KEY.pub`. It holds `user keytype key`. The directory
+  must be root-owned with mode 0711 and the file writable by root only, or the
+  signature is refused; the key inside must equal the one in the signature.
 - *On the host:* `witnesshell sign FILE`. The daemon identifies the witness by
   peer credentials and records the hash, so no private key is on the host.
 

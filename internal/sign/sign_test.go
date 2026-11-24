@@ -51,13 +51,25 @@ func sig(t *testing.T, key, ns, content string, opts ...string) []byte {
 	return out
 }
 
-func store(t *testing.T, signers string) *Store {
+// store makes a store whose key directory holds the given lines.
+func store(t *testing.T, lines ...string) *Store {
 	t.Helper()
-	s, err := ParseSigners(strings.NewReader(signers))
-	if err != nil {
+	d := t.TempDir()
+	k := KeyDir{Dir: filepath.Join(d, "keys"), Owner: uint32(os.Getuid())}
+	if err := os.Mkdir(k.Dir, 0o711); err != nil {
 		t.Fatal(err)
 	}
-	st := &Store{Dir: filepath.Join(t.TempDir(), "s"), Signers: s, LookupUID: lookup}
+	for _, l := range lines {
+		_, pub, _ := strings.Cut(l, " ")
+		n, err := PublicKeyName([]byte(pub))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(k.Dir, n), []byte(l+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := &Store{Dir: filepath.Join(d, "s"), Keys: k, LookupUID: lookup}
 	if err := st.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +81,7 @@ const script = "#!/bin/sh\necho hi\n"
 func TestSSHSignatures(t *testing.T) {
 	for _, typ := range []string{"ed25519", "ecdsa", "rsa"} {
 		k, pub := key(t, typ)
-		s := store(t, "# c\n\nbob "+pub+" comment\n")
+		s := store(t, "bob "+pub+" comment")
 		for _, h := range []string{"sha256", "sha512"} {
 			got, err := s.Install(strings.NewReader(script), sig(t, k, Namespace, script, "-O", "hashalg="+h), alice)
 			if err != nil {
@@ -99,7 +111,6 @@ func TestRefused(t *testing.T) {
 		"unknown key":       {"bob " + pub, script, sig(t, other, Namespace, script)},
 		"actor's key":       {"alice " + pub, script, good},
 		"shared with actor": {"bob,alice " + pub, script, good},
-		"shared, two lines": {"bob " + pub + "\nalice " + pub, script, good},
 		"unknown user":      {"mallory " + pub, script, good},
 		"corrupt":           {"bob " + pub, script, corrupt},
 		"garbage":           {"bob " + pub, script, []byte("garbage")},
@@ -119,7 +130,7 @@ func TestRefused(t *testing.T) {
 }
 
 func TestOnHostRecords(t *testing.T) {
-	s := store(t, "")
+	s := store(t)
 	d, _ := Hash(strings.NewReader(script))
 	if err := s.Record(alice, d); err != nil {
 		t.Fatal(err)
@@ -141,22 +152,55 @@ func TestOnHostRecords(t *testing.T) {
 	}
 }
 
-func TestParseSignersStrict(t *testing.T) {
-	_, pub := key(t, "ed25519")
-	for _, l := range []string{
-		"bob", "bob ssh-ed25519", "bob ssh-ed25519 AAAA", `bob namespaces="file" ` + pub,
-		"bob cert-authority " + pub, "* " + pub, "bob,, " + pub, "!bob " + pub,
-	} {
-		if _, err := ParseSigners(strings.NewReader(l)); err == nil {
-			t.Errorf("accepted %q", l)
+func TestKeyFileStrict(t *testing.T) {
+	k, pub := key(t, "ed25519")
+	_, other := key(t, "ed25519")
+	good := sig(t, k, Namespace, script)
+	name, err := PublicKeyName([]byte(pub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(what string, want bool, mess func(s *Store, file string)) {
+		t.Helper()
+		s := store(t, "bob "+pub)
+		mess(s, filepath.Join(s.Keys.Dir, name))
+		_, err := s.Install(strings.NewReader(script), good, alice)
+		if (err == nil) != want {
+			t.Errorf("%s: err = %v", what, err)
 		}
 	}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check("control", true, func(*Store, string) {})
+	for _, l := range []string{"", "bob", "bob ssh-ed25519", "bob ssh-ed25519 AAAA", `bob namespaces="file" ` + pub,
+		"bob cert-authority " + pub, "* " + pub, "bob,, " + pub, "!bob " + pub, "bob " + other,
+		"bob " + pub + "\ncarol " + pub} {
+		check(l, false, func(_ *Store, f string) { must(os.WriteFile(f, []byte(l), 0o644)) })
+	}
+	for _, m := range []os.FileMode{0o755, 0o711 | 0o020, 0o733, 0o700, 0o777} {
+		check("directory "+m.String(), false, func(s *Store, _ string) { must(os.Chmod(s.Keys.Dir, m)) })
+	}
+	for _, m := range []os.FileMode{0o664, 0o646} {
+		check("file "+m.String(), false, func(_ *Store, f string) { must(os.Chmod(f, m)) })
+	}
+	check("wrong owner", false, func(s *Store, _ string) { s.Keys.Owner++ })
+	check("removed key", false, func(_ *Store, f string) { must(os.Remove(f)) })
+	check("renamed key", false, func(_ *Store, f string) { must(os.Rename(f, f+"x")) })
+	check("symlink", false, func(_ *Store, f string) {
+		must(os.Rename(f, f+"x"))
+		must(os.Symlink(f+"x", f))
+	})
+	check("no directory", false, func(s *Store, _ string) { s.Keys.Dir += "x" })
 }
 
 func FuzzVerify(f *testing.F) {
 	f.Add([]byte("-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ==\n-----END SSH SIGNATURE-----\n"))
 	f.Fuzz(func(t *testing.T, b []byte) {
-		if _, err := (Signers{}).Verify(b, Digest{}); err == nil {
+		if _, err := (KeyDir{Dir: "/nonexistent"}).Verify(b, Digest{}); err == nil {
 			t.Fatal("verified with no signers")
 		}
 	})

@@ -3,7 +3,6 @@
 package sign
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -34,41 +33,6 @@ var (
 	ErrTooLarge  = errors.New("file is too large")
 )
 
-// Signers maps public keys (wire format) to the local users they belong to.
-type Signers map[string][]string
-
-// ParseSigners reads an allowed_signers file: "user[,user] keytype key". Key
-// options are refused rather than ignored, since they restrict a key.
-func ParseSigners(r io.Reader) (Signers, error) {
-	s := Signers{}
-	sc := bufio.NewScanner(r)
-	for n := 1; sc.Scan(); n++ {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || line[0] == '#' {
-			continue
-		}
-		f := strings.Fields(line)
-		if len(f) < 3 {
-			return nil, fmt.Errorf("allowed_signers line %d: want \"user keytype key\"", n)
-		}
-		key, _, opts, rest, err := ssh.ParseAuthorizedKey([]byte(f[1] + " " + f[2]))
-		if err != nil || len(opts) > 0 || len(rest) > 0 || key.Type() != f[1] {
-			return nil, fmt.Errorf("allowed_signers line %d: bad key or unsupported options", n)
-		}
-		if strings.HasSuffix(f[1], "-cert-v01@openssh.com") {
-			return nil, fmt.Errorf("allowed_signers line %d: certificates are not supported", n)
-		}
-		for _, u := range strings.Split(f[0], ",") {
-			if u == "" || strings.ContainsAny(u, "*?!\"") {
-				return nil, fmt.Errorf("allowed_signers line %d: bad user %q", n, u)
-			}
-			w := string(key.Marshal())
-			s[w] = append(s[w], u)
-		}
-	}
-	return s, sc.Err()
-}
-
 // Digest holds the hashes of a file's content.
 type Digest struct {
 	SHA256 [32]byte
@@ -94,7 +58,7 @@ func copyHash(w io.Writer, r io.Reader) (d Digest, err error) {
 
 // Verify checks an armored SSH signature (ssh-keygen -Y sign) and returns the
 // users the key belongs to.
-func (s Signers) Verify(armored []byte, d Digest) ([]string, error) {
+func (k KeyDir) Verify(armored []byte, d Digest) ([]string, error) {
 	p, _ := pem.Decode(armored)
 	if p == nil || p.Type != "SSH SIGNATURE" {
 		return nil, errors.New("not an SSH signature")
@@ -118,9 +82,9 @@ func (s Signers) Verify(armored []byte, d Digest) ([]string, error) {
 	if b.Version != 1 || b.Namespace != Namespace {
 		return nil, fmt.Errorf("signature is for namespace %q, want %q", b.Namespace, Namespace)
 	}
-	users := s[string(b.Key)]
-	if len(users) == 0 {
-		return nil, errors.New("signed with an unknown key")
+	users, err := k.Lookup(b.Key)
+	if err != nil {
+		return nil, err
 	}
 	key, err := ssh.ParsePublicKey(b.Key)
 	if err != nil {
@@ -157,8 +121,8 @@ func (s Signers) Verify(armored []byte, d Digest) ([]string, error) {
 // Store holds signed copies and on-host signatures under Dir, which must be
 // writable by root only.
 type Store struct {
-	Dir     string
-	Signers Signers
+	Dir  string
+	Keys KeyDir
 	// LookupUID returns the uid of a local user.
 	LookupUID func(string) (uint32, error)
 }
@@ -209,7 +173,7 @@ func (s *Store) Check(d Digest, armored []byte, actor uint32) (*Signed, error) {
 	var sigErr error
 	if armored != nil {
 		var users []string
-		users, sigErr = s.Signers.Verify(armored, d)
+		users, sigErr = s.Keys.Verify(armored, d)
 		for _, u := range users {
 			uid, err := s.LookupUID(u)
 			if err != nil {
