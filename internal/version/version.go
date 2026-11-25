@@ -16,5 +16,5 @@ const ProtocolVersion = 1
 
 // String returns a one-line human readable version description.
 func String() string {
-	return "witnesshell " + Version + " (" + Commit + ", " + runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH + ")"
+	return "witsh " + Version + " (" + Commit + ", " + runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH + ")"
 }

@@ -12,7 +12,7 @@ import (
 const sshd = "/usr/sbin/sshd"
 
 // Login returns what would let a user log in around witnesshell. self is the
-// path of the witnesshell binary.
+// path of the witsh binary.
 func Login(name, self string) ([]string, error) {
 	var out []string
 	sh, err := loginShell("/etc/passwd", name)

@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	binary = "/usr/local/bin/witnesshell"
+	binary = "/usr/local/bin/witsh"
 	sock   = "/run/witnesshell.sock"
 )
 
@@ -58,7 +58,7 @@ func startDaemon(t *testing.T, config string) *bytes.Buffer {
 	return nil
 }
 
-// window is a user's terminal running witnesshell attach.
+// window is a user's terminal running witsh attach.
 type window struct {
 	t    *testing.T
 	name string

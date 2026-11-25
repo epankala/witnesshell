@@ -33,7 +33,7 @@ func Bootstrap(stdout, stderr io.Writer) int {
 
 func runBootstrap(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
-		fmt.Fprintln(stderr, "usage: witnesshell bootstrap")
+		fmt.Fprintln(stderr, "usage: witsh bootstrap")
 		return ExitUsage
 	}
 	return Bootstrap(stdout, stderr)

@@ -34,7 +34,7 @@ func self() (launch.User, error) {
 // is information only: the launcher checks again.
 func runChecksig(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: witnesshell checksig FILE")
+		fmt.Fprintln(stderr, "usage: witsh checksig FILE")
 		return ExitUsage
 	}
 	u, err := self()
@@ -46,7 +46,7 @@ func runChecksig(args []string, stdout, stderr io.Writer) int {
 		err = view.Checksig(stdout, u, wd, args[0], systemStore(), u)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "witnesshell checksig: %v\n", err)
+		fmt.Fprintf(stderr, "witsh checksig: %v\n", err)
 		return ExitError
 	}
 	return ExitOK

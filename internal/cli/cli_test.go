@@ -17,7 +17,7 @@ func TestNoArgsShowsUsage(t *testing.T) {
 	if code != ExitUsage {
 		t.Fatalf("code = %d, want %d", code, ExitUsage)
 	}
-	if !strings.Contains(stderr, "usage: witnesshell") {
+	if !strings.Contains(stderr, "usage: witsh") {
 		t.Fatalf("stderr missing usage: %q", stderr)
 	}
 }
@@ -28,7 +28,7 @@ func TestVersion(t *testing.T) {
 		if code != ExitOK {
 			t.Fatalf("%s: code = %d", arg, code)
 		}
-		if !strings.HasPrefix(stdout, "witnesshell ") || !strings.Contains(stdout, "protocol 1") {
+		if !strings.HasPrefix(stdout, "witsh ") || !strings.Contains(stdout, "protocol 1") {
 			t.Fatalf("%s: unexpected output %q", arg, stdout)
 		}
 	}
@@ -106,8 +106,8 @@ func TestParseTicket(t *testing.T) {
 
 func TestLoginShell(t *testing.T) {
 	for in, want := range map[string]bool{
-		"-witnesshell": true, "witnesshell -c x": true, "": true, "-witnesshell daemon": true,
-		"witnesshell": false, "witnesshell daemon": false, "/usr/local/bin/witnesshell version": false,
+		"-witsh": true, "witsh -c x": true, "": true, "-witsh daemon": true,
+		"witsh": false, "witsh daemon": false, "/usr/local/bin/witsh version": false,
 	} {
 		if got := LoginShell(strings.Fields(in)); got != want {
 			t.Errorf("%q: %v", in, got)

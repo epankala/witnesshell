@@ -11,6 +11,9 @@ It guards against both mistakes and deliberate misuse: production maintenance,
 contractor access, four-eyes rules, and privileged work that must be reviewable
 afterwards.
 
+The command is `witsh`; group, service and paths on the host are named
+`witnesshell`.
+
 > [!WARNING]
 > **Under development.** Sessions work over SSH and QUIC. There is no audit log
 > yet. This page describes the intended whole; parts not built yet
@@ -127,14 +130,14 @@ ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n witnesshell deploy.sh
 # copy deploy.sh and deploy.sh.sig to the host, side by side
 ```
 
-**On the host**: `witnesshell sign deploy.sh`, or `S` while viewing a file as a
+**On the host**: `witsh sign deploy.sh`, or `S` while viewing a file as a
 witness. No private key is
 involved; the daemon records which logged-in user signed which content.
 
 Check a file:
 
 ```sh
-witnesshell checksig deploy.sh
+witsh checksig deploy.sh
 ```
 
 It shows the SHA-256, the owner, whether you could modify the file, and who
@@ -152,7 +155,7 @@ found from the signature itself. To add bob's key, as root:
 ```sh
 mkdir -p /etc/witnesshell
 install -d -m 711 /etc/witnesshell/public_keys
-name=$(witnesshell keyname bob.pub)
+name=$(witsh keyname bob.pub)
 printf 'bob %s\n' "$(cut -d' ' -f1,2 bob.pub)" > "/etc/witnesshell/public_keys/$name"
 chmod 644 "/etc/witnesshell/public_keys/$name"
 ```
@@ -277,18 +280,18 @@ Not on a machine you care about yet. As root, with an account outside the group
 
 ```sh
 # allow UDP port 60001 in the firewall
-install -m 755 witnesshell /usr/local/bin/
+install -m 755 witsh /usr/local/bin/
 groupadd -r witnesshell
 install -d -m 755 /etc/ssh/authorized_keys
 # for every user, after putting their key in /etc/ssh/authorized_keys/USER:
-usermod -s /usr/local/bin/witnesshell -aG witnesshell USER
+usermod -s /usr/local/bin/witsh -aG witnesshell USER
 cp deploy/10-witnesshell.conf /etc/ssh/sshd_config.d/
 sshd -t && systemctl reload ssh          # a mistake locks everyone out
 cp deploy/witnesshell.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now witnesshell
 ```
 
-Do not add witnesshell to `/etc/shells`. Meet the [host
+Do not add witsh to `/etc/shells`. Meet the [host
 requirements](#host-requirements) too; a refused session says what is missing.
 
 ## Using it
@@ -296,14 +299,14 @@ requirements](#host-requirements) too; a refused session says what is missing.
 Each user, from their own machine:
 
 ```sh
-witnesshell connect alice@host
+witsh connect alice@host
 ```
 
 ssh options may precede the host. UDP port 60001 must be reachable; with a jump
-host, name the address with `--udp-host=HOST`. `witnesshell connect --ssh
+host, name the address with `--udp-host=HOST`. `witsh connect --ssh
 alice@host`, or plain `ssh alice@host`, works without UDP.
 
-On the host itself, `witnesshell attach` does the same.
+On the host itself, `witsh attach` does the same.
 
 | Actor | Witness |
 |---|---|
@@ -330,7 +333,7 @@ dependencies.
 
 ```sh
 make            # format check, vet, tests, build amd64 and arm64, verify static
-make build      # just dist/witnesshell-linux-{amd64,arm64}
+make build      # just dist/witsh-linux-{amd64,arm64}
 make check      # just format check, vet and tests
 ```
 

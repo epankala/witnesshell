@@ -59,12 +59,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	cmd, ok := commands[name]
 	if !ok {
-		fmt.Fprintf(stderr, "witnesshell: unknown command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "witsh: unknown command %q\n\n", args[0])
 		usage(stderr)
 		return ExitUsage
 	}
 	if cmd.run == nil {
-		fmt.Fprintf(stderr, "witnesshell %s: not implemented yet (milestone %s)\n", name, cmd.milestone)
+		fmt.Fprintf(stderr, "witsh %s: not implemented yet (milestone %s)\n", name, cmd.milestone)
 		return ExitNotImplemented
 	}
 	return cmd.run(args[1:], stdout, stderr)
@@ -72,7 +72,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 func runKeyname(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: witnesshell keyname KEY.pub")
+		fmt.Fprintln(stderr, "usage: witsh keyname KEY.pub")
 		return ExitUsage
 	}
 	b, err := os.ReadFile(args[0])
@@ -81,7 +81,7 @@ func runKeyname(args []string, stdout, stderr io.Writer) int {
 		name, err = sign.PublicKeyName(b)
 	}
 	if err != nil {
-		fmt.Fprintln(stderr, "witnesshell keyname:", err)
+		fmt.Fprintln(stderr, "witsh keyname:", err)
 		return ExitError
 	}
 	fmt.Fprintln(stdout, name)
@@ -90,7 +90,7 @@ func runKeyname(args []string, stdout, stderr io.Writer) int {
 
 func runVersion(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 0 {
-		fmt.Fprintln(stderr, "usage: witnesshell version")
+		fmt.Fprintln(stderr, "usage: witsh version")
 		return ExitUsage
 	}
 	fmt.Fprintln(stdout, version.String())
@@ -99,7 +99,7 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: witnesshell <command> [args]")
+	fmt.Fprintln(w, "usage: witsh <command> [args]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "commands:")
 	names := make([]string, 0, len(commands))

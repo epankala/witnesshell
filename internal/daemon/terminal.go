@@ -58,7 +58,7 @@ func Terminal() error {
 		}
 	}
 	_ = unix.Close(5)
-	return syscall.Exec("/proc/self/exe", []string{"witnesshell", LeaderArg}, []string{})
+	return syscall.Exec("/proc/self/exe", []string{"witsh", LeaderArg}, []string{})
 }
 
 // ptmxDevice makes sure that /dev/ptmx opens the new instance. The usual

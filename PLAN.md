@@ -39,6 +39,7 @@
 | D30 | Initially, users' public keys are root-owned files in `/etc/witnesshell/public_keys/`. The directory **cannot be listed** (0711); the file name follows from the signature |
 | D31 | A witness **never acts with the actor's permissions**. To show a private file, the actor displays it in the session or makes it readable to the witness |
 | D32 | **Everything ends at logout.** Its witnesses are returned to the list of sessions, where they can witness another actor if there is one |
+| D33 | The binary and command are **`witsh`**; the project, group, service, config and state paths, signature namespace and protocol keep the name witnesshell. `wish` is taken by Tcl/Tk |
 
 ## 1. Goal
 
@@ -56,14 +57,14 @@ SSH is used only for login and bootstrap. The session itself runs over
 ```
  actor laptop                      remote host                     witness laptop
  ────────────                      ───────────                     ──────────────
- witnesshell connect alice@host
-   └─ ssh alice@host  (ForceCommand → witnesshell bootstrap)
+ witsh connect alice@host
+   └─ ssh alice@host  (ForceCommand → witsh bootstrap)
                                    witnesshelld (daemon, root)
                                      ├─ peer uid = alice (SO_PEERCRED)
                                      ├─ no sessions → create S1, PTY shell as alice
                                      └─ → port, cert-hash, token, S1
    ssh exits; QUIC ──────────────▶ UDP :60001  ◀────────────── QUIC
-                                                     witnesshell connect bob@host
+                                                     witsh connect bob@host
                                                        └─ ssh bob@host → bootstrap
                                      ├─ peer uid = bob, sessions exist → ask:
                                      │    [1] witness alice's session S1
@@ -71,9 +72,9 @@ SSH is used only for login and bootstrap. The session itself runs over
                                      └─ → port, cert-hash, token, S1, role
 ```
 
-1. Everyone uses the same command, `witnesshell connect user@host`. It runs
+1. Everyone uses the same command, `witsh connect user@host`. It runs
    the system `ssh`, so `~/.ssh/config`, agents and jump hosts all work.
-2. sshd forces `witnesshell bootstrap` (`ForceCommand`) for every
+2. sshd forces `witsh bootstrap` (`ForceCommand`) for every
    member of group `witnesshell`. Bootstrap talks to the daemon over
    `/run/witnesshell.sock`; the daemon identifies the caller by kernel
    peer credentials.
@@ -115,7 +116,7 @@ only runs `quic 1`, which the bootstrap answers with
 | Requirement | Why |
 |---|---|
 | The shell process of each session is **root** and leads the terminal's session; programs run as the actor, and the shell touches files on a thread with the actor's file access and no capabilities | Only the parent of the jobs can do job control. Tested: the actor can neither kill, trace nor read it, and redirections cannot reach its own `/proc` files |
-| `Match Group witnesshell` → `ForceCommand witnesshell bootstrap`, `AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, no sftp subsystem | Otherwise the actor opens a plain shell or tunnels around the gate |
+| `Match Group witnesshell` → `ForceCommand witsh bootstrap`, `AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`, no sftp subsystem | Otherwise the actor opens a plain shell or tunnels around the gate |
 | The shell never reads commands from the PTY (§4.3) | Type-ahead would run unapproved |
 | Actor uid ≠ witness uid | No self-witnessing |
 | Admin break-glass access (console / separate un-forced admin account) is outside witnesshell and documented | Need a way in if the daemon is broken |
@@ -240,10 +241,10 @@ what runs, so a later edit has no effect. Two ways to sign:
   checked against `/etc/witnesshell/public_keys/` (D30), never against
   `~/.ssh`, which users can edit. An SSH signature holds the signer's public
   key but no name, so a key's file is named by the SHA-256 of that key:
-  `witnesshell keyname KEY.pub`. It holds `user keytype key`. The directory
+  `witsh keyname KEY.pub`. It holds `user keytype key`. The directory
   must be root-owned with mode 0711 and the file writable by root only, or the
   signature is refused; the key inside must equal the one in the signature.
-- *On the host:* `witnesshell sign FILE`. The daemon identifies the witness by
+- *On the host:* `witsh sign FILE`. The daemon identifies the witness by
   peer credentials and records the hash, so no private key is on the host.
 
 ### 4.5 Kernel restrictions
@@ -314,8 +315,8 @@ Both start no program. Rules:
   witness compare; for signed files the stored copy runs (§4.4).
 
 ### 4.7 Daemon and clients (M2c, on one host)
-- `witnesshell daemon` (root) listens on `/run/witnesshell.sock`. The kernel
-  says which user connects. `witnesshell attach` offers the sessions (D14).
+- `witsh daemon` (root) listens on `/run/witnesshell.sock`. The kernel
+  says which user connects. `witsh attach` offers the sessions (D14).
 - One root process per session (`internal/daemon/leader.go`) runs the shell;
   the daemon keeps gate and terminal. Messages are length-prefixed JSON.
 - **Connections from inside a session are refused**, by cgroup, so an approved
@@ -439,7 +440,7 @@ gives two sessions the same start time. Files are owned by root, mode 0600.
 Each entry carries the SHA-256 of the previous one, forming a chain per file.
 Votes carry the request ID and hash in both logs, and the final hash of every
 witness log goes into the actor log, so a removed or altered file is noticed.
-`witnesshell audit verify <session start>` checks a session's files together.
+`witsh audit verify <session start>` checks a session's files together.
 
 ### 8.1 Recording: asciicast v2 (D9)
 
@@ -479,7 +480,7 @@ Build: `CGO_ENABLED=0 GOOS=linux GOARCH={amd64,arm64} go build -trimpath -ldflag
 ## 10. Code layout
 
 ```
-cmd/witnesshell/        one binary: connect | bootstrap | daemon | sessions | audit verify | version
+cmd/witsh/              one binary: connect | bootstrap | daemon | sessions | audit verify | version
 internal/wire/          messages, protocol version
 internal/transport/     QUIC server/client, cert pinning, resume tokens
 internal/bootstrap/     ssh exec, role menu, handshake line
@@ -507,7 +508,7 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 | M1 | Gate core | `gate` state machine (draft, pending, K-of-N, veto, comment, cancel, purge) fully unit-tested, no I/O |
 | M2a | Trust & launcher | trust rules, signed store, uid switch, Landlock, host checks; every attack in §4.5 is a VM regression test (`make vm-test`) |
 | M2b | Shell language | strict parser, expansion to exact plan, job control, Ctrl-C/Z; attack tests ported from `internal/shell`, which is then removed |
-| M2c | Local session | gate + shell + daemon; `witnesshell sign`; `view`, `checksig` in a session; actor and witness over the **unix socket** on one host (no network yet) |
+| M2c | Local session | gate + shell + daemon; `witsh sign`; `view`, `checksig` in a session; actor and witness over the **unix socket** on one host (no network yet) |
 | M3 | Bootstrap & roles | ssh bootstrap, role menu, `max_sessions`, ForceCommand docs |
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |

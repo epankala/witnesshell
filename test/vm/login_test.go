@@ -128,7 +128,7 @@ chown -R alice: .; chmod 700 .ssh`)
 	a.typ("test\r")
 	time.Sleep(2 * time.Second)
 	a.typ("\x03")
-	if s := sh(t, "getent passwd alice"); !strings.Contains(s, "/usr/local/bin/witnesshell") {
+	if s := sh(t, "getent passwd alice"); !strings.Contains(s, "/usr/local/bin/witsh") {
 		t.Errorf("shell changed: %s", s)
 	}
 }
@@ -225,8 +225,8 @@ func TestLoginHostCheck(t *testing.T) {
 	conf := "/etc/ssh/sshd_config.d/10-witnesshell.conf"
 	defer forceLogin(t)
 	for _, c := range [][2]string{
-		{"usermod -s /bin/bash alice", "usermod -s /usr/local/bin/witnesshell alice"},
-		{"echo /usr/local/bin/witnesshell >>/etc/shells", "sed -i /witnesshell/d /etc/shells"},
+		{"usermod -s /bin/bash alice", "usermod -s /usr/local/bin/witsh alice"},
+		{"echo /usr/local/bin/witsh >>/etc/shells", "sed -i /witsh/d /etc/shells"},
 		{"gpasswd -d alice witnesshell", "gpasswd -a alice witnesshell"},
 		{"sed -i s/DisableForwarding/#/ " + conf, "cp /usr/local/lib/deploy/10-witnesshell.conf " + conf},
 		{"sed -i s/AuthorizedKeysFile/#/ " + conf, "cp /usr/local/lib/deploy/10-witnesshell.conf " + conf},

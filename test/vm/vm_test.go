@@ -134,7 +134,7 @@ func forceLogin(t *testing.T) {
 	sh(t, `getent group witnesshell >/dev/null || groupadd -r witnesshell
 mkdir -p /etc/ssh/authorized_keys
 for u in alice bob carol; do
-  usermod -s /usr/local/bin/witnesshell -aG witnesshell $u
+  usermod -s /usr/local/bin/witsh -aG witnesshell $u
   [ -f /etc/ssh/authorized_keys/$u ] || cp /home/$u/.ssh/authorized_keys /etc/ssh/authorized_keys/$u
 done
 chown -R root: /etc/ssh/authorized_keys; chmod 755 /etc/ssh/authorized_keys; chmod 644 /etc/ssh/authorized_keys/*

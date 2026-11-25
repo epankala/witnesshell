@@ -25,7 +25,7 @@ import (
 )
 
 func fail(stderr io.Writer, cmd string, err error) int {
-	fmt.Fprintf(stderr, "witnesshell %s: %s\n", cmd, err)
+	fmt.Fprintf(stderr, "witsh %s: %s\n", cmd, err)
 	return ExitError
 }
 
@@ -96,7 +96,7 @@ func dial() (net.Conn, error) {
 
 func runSessions(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
-		fmt.Fprintln(stderr, "usage: witnesshell sessions")
+		fmt.Fprintln(stderr, "usage: witsh sessions")
 		return ExitUsage
 	}
 	c, err := dial()
@@ -118,7 +118,7 @@ func runSign(args []string, stdout, stderr io.Writer) int {
 	f := flags("sign", stderr)
 	want := f.String("sha256", "", "refuse unless the file has this `hash`")
 	if f.Parse(args) != nil || f.NArg() != 1 {
-		fmt.Fprintln(stderr, "usage: witnesshell sign [-sha256 HASH] FILE")
+		fmt.Fprintln(stderr, "usage: witsh sign [-sha256 HASH] FILE")
 		return ExitUsage
 	}
 	file, err := os.Open(f.Arg(0))
@@ -150,7 +150,7 @@ func runAttach(args []string, stdout, stderr io.Writer) int {
 	start := f.Bool("new", false, "start a session")
 	id := f.String("session", "", "join this session `id`")
 	if f.Parse(args) != nil || f.NArg() > 0 || *start && *id != "" {
-		fmt.Fprintln(stderr, "usage: witnesshell attach [-new | -session ID]")
+		fmt.Fprintln(stderr, "usage: witsh attach [-new | -session ID]")
 		return ExitUsage
 	}
 	if !term.IsTerminal(0) || !term.IsTerminal(1) {
@@ -188,13 +188,13 @@ func attachOnce(d dialer, start bool, id string, lobby bool, stdout io.Writer) (
 	res, err := ui.Run(joiner{d}, q, os.Stdin, os.Stdout)
 	if err != nil {
 		if lobby { // for example, the session has ended meanwhile
-			fmt.Fprintf(stdout, "witnesshell: %s\n", err)
+			fmt.Fprintf(stdout, "witsh: %s\n", err)
 			return true, nil
 		}
 		return false, err
 	}
 	if res.Why != "" {
-		fmt.Fprintf(stdout, "witnesshell: %s\n", view.Escape(res.Why))
+		fmt.Fprintf(stdout, "witsh: %s\n", view.Escape(res.Why))
 	}
 	return res.Ended && q.Type == wire.Witness, nil
 }

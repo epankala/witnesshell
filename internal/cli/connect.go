@@ -128,7 +128,7 @@ func parseTicket(r io.Reader) (ticket, error) {
 			return ticket{int(p), m[2], m[3]}, nil
 		}
 	}
-	return ticket{}, errors.New("the host did not offer a session; is witnesshell its login shell?")
+	return ticket{}, errors.New("the host did not offer a session; is witsh its login shell?")
 }
 
 // giveTicket is the remote side of connect.
@@ -166,7 +166,7 @@ func parseConnect(args []string) (o connectOptions, err error) {
 	}
 	// The last argument is the host, so that nothing follows it as a command.
 	if len(args) == 0 || args[len(args)-1] == "" || strings.HasPrefix(args[len(args)-1], "-") {
-		return o, errors.New("usage: witnesshell connect [--ssh] [--udp-host=HOST] [ssh options] [user@]host")
+		return o, errors.New("usage: witsh connect [--ssh] [--udp-host=HOST] [ssh options] [user@]host")
 	}
 	o.opts, o.host = args[:len(args)-1], args[len(args)-1]
 	return o, nil

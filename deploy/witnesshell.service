@@ -3,7 +3,7 @@ Description=witnesshell session daemon
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/witnesshell daemon
+ExecStart=/usr/local/bin/witsh daemon
 Restart=on-failure
 # The daemon ends its sessions itself; they live in their own cgroups.
 KillMode=process

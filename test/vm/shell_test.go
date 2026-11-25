@@ -428,23 +428,23 @@ func TestChecksigCommand(t *testing.T) {
 	// The real command, as alice, with unlistable directories.
 	harden(t)
 	fixtures(t)
-	bin := "/usr/local/bin/witnesshell"
+	bin := "/usr/local/bin/witsh"
 	if !exists(bin) {
 		t.Skip("binary not installed")
 	}
 	s := shell(t)
-	s.expect("witnesshell checksig s.sh", "signed   no", 0)
-	s.expect("witnesshell checksig /usr/bin/env", "trusted  yes", 0)
+	s.expect("witsh checksig s.sh", "signed   no", 0)
+	s.expect("witsh checksig /usr/bin/env", "trusted  yes", 0)
 	s.expect("ls /var/lib/witnesshell/records", "denied", 2)
 	signHere(t, home+"/s.sh", bob.UID)
-	s.expect("witnesshell checksig s.sh", fmt.Sprintf(`by uid %d`, bob.UID), 0)
+	s.expect("witsh checksig s.sh", fmt.Sprintf(`by uid %d`, bob.UID), 0)
 	s.expect("./s.sh", "", 0)
 	if !exists(marker) {
 		t.Error("signed script did not run")
 	}
 	signHere(t, home+"/s.sh", alice.UID)
-	s.expect("witnesshell checksig s.sh", "does not count", 0)
-	s.expect("witnesshell checksig /root/secret", "denied", 1)
+	s.expect("witsh checksig s.sh", "does not count", 0)
+	s.expect("witsh checksig /root/secret", "denied", 1)
 }
 
 func TestShellView(t *testing.T) {

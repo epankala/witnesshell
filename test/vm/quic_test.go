@@ -177,7 +177,7 @@ func TestQUICLogin(t *testing.T) {
 	must(err)
 	say(w, wire.Request{Type: wire.Witness, Session: id})
 	until(t, w, phase(wire.Prompt))
-	say(st, wire.Request{Type: wire.Key, Data: []byte("env SSH_ORIGINAL_COMMAND=x witnesshell bootstrap; env SSH_ORIGINAL_COMMAND='quic 1' witnesshell bootstrap\r")})
+	say(st, wire.Request{Type: wire.Key, Data: []byte("env SSH_ORIGINAL_COMMAND=x witsh bootstrap; env SSH_ORIGINAL_COMMAND='quic 1' witsh bootstrap\r")})
 	p := until(t, w, phase(wire.Pending))
 	say(w, wire.Request{Type: wire.Vote, ID: p.ID, Approve: true})
 	out, sc := "", scr{}

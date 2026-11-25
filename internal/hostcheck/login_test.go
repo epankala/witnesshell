@@ -8,7 +8,7 @@ import (
 )
 
 func TestSSHProblems(t *testing.T) {
-	self := filepath.Join(t.TempDir(), "witnesshell")
+	self := filepath.Join(t.TempDir(), "witsh")
 	if err := os.WriteFile(self, nil, 0o755); err != nil {
 		t.Fatal(err)
 	}

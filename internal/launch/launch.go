@@ -37,7 +37,7 @@ func Start(p *Plan, o Options) (*exec.Cmd, error) {
 	}
 	defer w.Close()
 	cmd := exec.Command("/proc/self/exe", HelperArg)
-	cmd.Args[0] = "witnesshell"
+	cmd.Args[0] = "witsh"
 	cmd.Env = []string{}
 	cmd.Dir = "/"
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = o.Stdin, o.Stdout, o.Stderr

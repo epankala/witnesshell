@@ -17,11 +17,11 @@ export CGO_ENABLED := 0
 
 all: check build verify-static
 
-build: $(foreach a,$(ARCHES),$(DIST)/witnesshell-linux-$(a))
+build: $(foreach a,$(ARCHES),$(DIST)/witsh-linux-$(a))
 
-$(DIST)/witnesshell-linux-%: FORCE
+$(DIST)/witsh-linux-%: FORCE
 	@mkdir -p $(DIST)
-	GOOS=linux GOARCH=$* $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $@ ./cmd/witnesshell
+	GOOS=linux GOARCH=$* $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $@ ./cmd/witsh
 
 check: fmt-check vet test
 
@@ -36,7 +36,7 @@ test:
 
 # A static ELF has no PT_INTERP program header and no .dynamic section.
 verify-static: build
-	@for f in $(DIST)/witnesshell-linux-*; do \
+	@for f in $(DIST)/witsh-linux-*; do \
 		if readelf -lW $$f | grep -q 'Requesting program interpreter' || \
 		   readelf -dW $$f | grep -q 'Dynamic section'; then \
 			echo "NOT static: $$f"; exit 1; \
@@ -54,11 +54,11 @@ export VM VM_DIR VM_QEMU_ROOT VM_UDP_PORT VM_SSH_PORT VM_MEM VM_CPUS VM_USER
 
 # Runs the attack tests as root inside the VM, starting it if needed.
 .PHONY: vm-test
-vm-test: vm-start $(DIST)/witnesshell-linux-amd64
+vm-test: vm-start $(DIST)/witsh-linux-amd64
 	$(GO) vet -tags vmtest ./test/vm
 	GOOS=linux GOARCH=amd64 $(GO) test -c -tags vmtest -o $(DIST)/vm.test ./test/vm
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/lib/vm.test && chmod 755 /usr/local/lib/vm.test"' <$(DIST)/vm.test
-	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/bin/witnesshell && chmod 755 /usr/local/bin/witnesshell"' <$(DIST)/witnesshell-linux-amd64
+	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/bin/witsh && chmod 755 /usr/local/bin/witsh"' <$(DIST)/witsh-linux-amd64
 	@tar -c deploy | VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo rm -rf /usr/local/lib/deploy; sudo tar -x --no-same-owner -C /usr/local/lib'
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'cd / && sudo timeout 3600 /usr/local/lib/vm.test -test.v -test.timeout 3500s $(VMTEST_ARGS)' </dev/null
 
