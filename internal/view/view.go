@@ -3,6 +3,8 @@ package view
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +42,11 @@ func Load(u launch.User, dir, name string) (*Doc, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return LoadFile(f, abs(dir, name))
+}
+
+// LoadFile reads an open file, which is called name.
+func LoadFile(f *os.File, name string) (*Doc, error) {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return nil, err
@@ -49,12 +56,65 @@ func Load(u launch.User, dir, name string) (*Doc, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Doc{Path: abs(dir, name), SHA256: dg.Hex(), Owner: st.Uid, Mode: st.Mode & 0o7777, Size: st.Size, Truncated: buf.cut}
+	d := &Doc{Path: name, SHA256: dg.Hex(), Owner: st.Uid, Mode: st.Mode & 0o7777, Size: st.Size, Truncated: buf.cut}
 	text := strings.TrimSuffix(buf.b.String(), "\n")
 	for _, l := range strings.Split(text, "\n") {
 		d.Lines = append(d.Lines, Escape(l))
 	}
 	return d, nil
+}
+
+// Text reads up to max bytes of an open file as lines, unchanged.
+func Text(f *os.File, max int64) ([]string, error) {
+	b, err := io.ReadAll(io.NewSectionReader(f, 0, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, errors.New("too large")
+	}
+	if bytes.IndexByte(b, 0) >= 0 || !utf8.Valid(b) {
+		return nil, errors.New("not text")
+	}
+	if len(b) == 0 {
+		return nil, nil
+	}
+	return strings.Split(strings.TrimSuffix(string(b), "\n"), "\n"), nil
+}
+
+// Open opens a regular file with u's permissions.
+func Open(u launch.User, dir, name string) (*os.File, error) { return open(u, dir, name) }
+
+// ErrStopped means that stop told Sha256 to give up.
+var ErrStopped = errors.New("stopped")
+
+// Sha256 hashes a file of any size with u's permissions.
+func Sha256(u launch.User, dir, name string, stop func() bool, progress func(done, size int64)) (hash string, size int64, err error) {
+	f, err := open(u, dir, name)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	h, b := sha256.New(), make([]byte, 1<<20)
+	for {
+		if stop() {
+			return "", 0, ErrStopped
+		}
+		n, err := f.Read(b)
+		_, _ = h.Write(b[:n])
+		size += int64(n)
+		if err == io.EOF {
+			return hex.EncodeToString(h.Sum(nil)), size, nil
+		}
+		if err != nil {
+			return "", 0, err
+		}
+		progress(size, st.Size())
+	}
 }
 
 // limited keeps the first maxShown bytes.

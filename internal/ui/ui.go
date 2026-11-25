@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
+	"witnesshell/internal/transfer"
 	"witnesshell/internal/transport"
 	"witnesshell/internal/view"
 	"witnesshell/internal/wire"
@@ -38,6 +39,12 @@ const (
 	comment
 	askView
 	askSig
+	askHash
+	menu // the actor's own, opened with Ctrl-]
+	askSend
+	askSendTo
+	askGet
+	askGetTo
 	paging
 	confirmSign
 )
@@ -67,6 +74,11 @@ type ui struct {
 	shownID uint64
 	shownAt time.Time
 	bell    bool
+	local   string // what the first question of a transfer was answered with
+	copying bool
+	done    chan struct{}
+	notes   chan note
+	open    func() (net.Conn, error)
 	prev    []string
 	real    map[int]bool // modes set on the user's terminal
 }
@@ -84,6 +96,14 @@ type Joiner interface {
 	Join(q wire.Request) (net.Conn, <-chan io.Reader, error)
 	// Retry reports whether a lost connection should be made again.
 	Retry() bool
+	// Open makes a connection for copying a file; nil if that is impossible.
+	Open() func() (net.Conn, error)
+}
+
+// note is news about a file that is being copied.
+type note struct {
+	text string
+	done bool
 }
 
 const (
@@ -100,13 +120,14 @@ type event struct {
 
 // Run joins a session. Nothing reads from in once it has returned.
 func Run(j Joiner, q wire.Request, in, out *os.File) (Result, error) {
-	u := &ui{out: out, actor: q.Type == wire.Actor, real: map[int]bool{}, retry: j.Retry()}
+	u := &ui{out: out, actor: q.Type == wire.Actor, real: map[int]bool{}, retry: j.Retry(), open: j.Open(), notes: make(chan note)}
 	if err := u.size(out); err != nil {
 		return Result{}, err
 	}
 	q.Rows, q.Cols = u.termSize()
 	done := make(chan struct{})
 	defer close(done)
+	u.done = done
 	events := make(chan event)
 	gen := 0
 	// use starts reading from a new connection.
@@ -244,6 +265,11 @@ func Run(j Joiner, q wire.Request, in, out *os.File) (Result, error) {
 				return Result{why, true}, nil
 			}
 			dirty = true
+		case n := <-u.notes:
+			u.message, dirty = n.text, true
+			if n.done {
+				u.copying = false
+			}
 		case n := <-rejoined:
 			if n.err != nil {
 				return Result{Why: "the session could not be resumed: " + n.err.Error()}, nil
@@ -284,6 +310,9 @@ func Run(j Joiner, q wire.Request, in, out *os.File) (Result, error) {
 		}
 	}
 }
+
+// maxDownload bounds what is taken from a host.
+const maxDownload = 1 << 40
 
 // trouble describes what is wrong with the connection, if anything.
 func (u *ui) trouble() string {
@@ -438,17 +467,26 @@ func (u *ui) receive(r wire.Reply) (why string, over bool) {
 
 // key handles typed bytes. It reports whether to leave.
 func (u *ui) key(b []byte) bool {
-	if u.actor {
+	if u.actor && u.mode == watching {
 		for i, c := range b {
-			if c == detachKey {
-				if i > 0 && u.conn != nil {
-					u.request(wire.Request{Type: wire.Key, Data: b[:i]})
-				}
+			if c != detachKey {
+				continue
+			}
+			if i > 0 && u.conn != nil {
+				u.request(wire.Request{Type: wire.Key, Data: b[:i]})
+			}
+			if u.open == nil || u.conn == nil {
 				return true
 			}
+			// What follows in the same piece was not typed in answer to the menu.
+			u.mode, u.message = menu, ""
+			return false
 		}
 		u.request(wire.Request{Type: wire.Key, Data: b})
 		return false
+	}
+	if u.mode == menu {
+		return u.menuKey(b[0])
 	}
 	s := string(b)
 	if b[0] == 0x1b && len(b) > 1 && (u.mode == watching || u.mode == paging) {
@@ -481,10 +519,11 @@ func (u *ui) key(b []byte) bool {
 		}
 		for _, r := range s {
 			// After Enter the rest must not be taken as other keys.
-			if u.mode != comment && u.mode != askView && u.mode != askSig {
+			if m := u.mode; m == watching || m == paging {
+				break
+			} else if u.editKey(string(r)); u.mode != m {
 				break
 			}
-			u.editKey(string(r))
 		}
 	}
 	return false
@@ -513,6 +552,16 @@ func (u *ui) watchKey(k byte) bool {
 		u.mode, u.input = askView, nil
 	case 's':
 		u.mode, u.input = askSig, nil
+	case 'h':
+		u.mode, u.input = askHash, nil
+	case 'o', 'd':
+		if !u.st.Transfer {
+			u.message = "no file is waiting for approval"
+		} else if k == 'o' {
+			u.request(wire.Request{Type: wire.Staged})
+		} else {
+			u.request(wire.Request{Type: wire.Changes})
+		}
 	case ' ', 'f':
 		u.scroll += max(1, u.detailRows())
 	case 'b':
@@ -525,6 +574,49 @@ func (u *ui) watchKey(k byte) bool {
 		return true
 	}
 	return false
+}
+
+// menuKey handles the actor's menu, of which the host knows nothing.
+func (u *ui) menuKey(k byte) bool {
+	u.mode, u.input = watching, nil
+	switch k {
+	case 'd', detachKey:
+		return true
+	case 'u', 'g':
+		switch {
+		case u.copying:
+			u.message = "a file is being copied already"
+		case k == 'u':
+			u.mode = askSend
+		default:
+			u.mode = askGet
+		}
+	}
+	return false
+}
+
+// copyFile runs a transfer in the background.
+func (u *ui) copyFile(f func(say func(string)) error, done string) {
+	u.copying = true
+	tell := func(n note) {
+		select {
+		case u.notes <- n:
+		case <-u.done:
+		}
+	}
+	go func() {
+		last := time.Time{}
+		err := f(func(s string) {
+			if time.Since(last) > 200*time.Millisecond || !strings.HasSuffix(s, "%") {
+				last = time.Now()
+				tell(note{s, false})
+			}
+		})
+		if err != nil {
+			done = "NOT COPIED: " + err.Error()
+		}
+		tell(note{done, true})
+	}()
 }
 
 func (u *ui) editKey(s string) {
@@ -542,6 +634,22 @@ func (u *ui) editKey(s string) {
 			u.request(wire.Request{Type: wire.View, Text: text})
 		case u.mode == askSig:
 			u.request(wire.Request{Type: wire.Checksig, Text: text})
+		case u.mode == askHash:
+			u.request(wire.Request{Type: wire.Sha256, Text: text})
+		case u.mode == askSend:
+			u.local, u.mode, u.input = text, askSendTo, nil
+			return
+		case u.mode == askGet:
+			u.local, u.mode, u.input = text, askGetTo, nil
+			return
+		case u.mode == askSendTo:
+			session, local := u.st.Session, u.local
+			u.copyFile(func(say func(string)) error { return transfer.Upload(u.open, session, local, text, say) }, "uploaded")
+		case u.mode == askGetTo:
+			session, remote := u.st.Session, u.local
+			u.copyFile(func(say func(string)) error {
+				return transfer.Download(u.open, session, remote, text, maxDownload, say)
+			}, "saved as "+text)
 		}
 		u.mode, u.message = watching, ""
 	case s == "\x1b" || s == "\x03":

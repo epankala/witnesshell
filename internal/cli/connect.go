@@ -92,6 +92,14 @@ type joiner struct{ d dialer }
 
 func (j joiner) Retry() bool { return j.d.lasting() }
 
+// Open is for copying files, which needs the client to be elsewhere.
+func (j joiner) Open() func() (net.Conn, error) {
+	if !j.d.lasting() {
+		return nil
+	}
+	return j.d.open
+}
+
 func (j joiner) Join(q wire.Request) (net.Conn, <-chan io.Reader, error) {
 	c, err := j.d.open()
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -212,7 +213,7 @@ func (p *Prepared) Builtin() []string { return p.builtin }
 
 // Free reports whether the line needs no approval.
 func (p *Prepared) Free() bool {
-	return p.builtin != nil && (p.builtin[0] == "view" || p.builtin[0] == "checksig" || p.builtin[0] == "exit")
+	return p.builtin != nil && (p.builtin[0] == "view" || p.builtin[0] == "checksig" || p.builtin[0] == "sha256" || p.builtin[0] == "exit")
 }
 
 // Describe tells witnesses exactly what will run. All text is safe to print.
@@ -314,7 +315,7 @@ func (p *Prepared) Warnings() []string {
 var builtins = map[string]func(s *Shell, args []string) (int, error){
 	"cd": (*Shell).cd, "export": (*Shell).export, "unset": (*Shell).unset, "umask": (*Shell).setUmask,
 	"jobs": (*Shell).listJobs, "fg": (*Shell).fg, "bg": (*Shell).bg, "kill": (*Shell).kill, "exit": (*Shell).exit,
-	"view": (*Shell).view, "checksig": (*Shell).checksig,
+	"view": (*Shell).view, "checksig": (*Shell).checksig, "sha256": (*Shell).sha256,
 }
 
 // Names that bash would treat as builtins. The program of the same name, if
@@ -775,6 +776,55 @@ func (s *Shell) checksig(args []string) (int, error) {
 	s.inspected = h
 	return 0, nil
 }
+
+// sha256 prints hashes of files of any size in the format of sha256sum, whose
+// -c ignores the lines with the sizes. Ctrl-C stops it.
+func (s *Shell) sha256(args []string) (int, error) {
+	if len(args) == 0 {
+		return 1, errors.New("want files")
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, unix.SIGINT)
+	defer signal.Stop(ch)
+	stop := func() bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	status := 0
+	var all []string
+	for _, a := range args {
+		last, shown := time.Now(), false
+		h, size, err := view.Sha256(s.c.User, s.dir, a, stop, func(done, size int64) {
+			if time.Since(last) > time.Second && size > 0 {
+				last, shown = time.Now(), true
+				fmt.Fprintf(s.out(), "\r%s: %d%% ", view.Escape(a), min(100, done*100/size))
+			}
+		})
+		if shown {
+			fmt.Fprint(s.out(), "\r\x1b[K")
+		}
+		if errors.Is(err, view.ErrStopped) {
+			s.inspected = strings.Join(all, " ")
+			return 128 + int(unix.SIGINT), err
+		}
+		if err != nil {
+			fmt.Fprintf(s.out(), "sha256: %v\n", err)
+			status = 1
+			continue
+		}
+		all = append(all, h)
+		fmt.Fprintf(s.out(), "# %d bytes\n%s  %s\n", size, h, view.Escape(a))
+	}
+	s.inspected = strings.Join(all, " ")
+	return status, nil
+}
+
+// Umask returns the mask for new files.
+func (s *Shell) Umask() int { return s.umask }
 
 func (s *Shell) export(args []string) (int, error) {
 	if len(args) == 0 {

@@ -2,6 +2,8 @@ package ui
 
 import (
 	"bytes"
+	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -108,5 +110,65 @@ func TestNoConnection(t *testing.T) {
 	}
 	if !u.key([]byte("q")) {
 		t.Fatal("cannot leave")
+	}
+}
+
+func TestLocalMenu(t *testing.T) {
+	u, out := testUI(true)
+	a, b := net.Pipe()
+	defer b.Close()
+	u.conn = a
+	u.notes, u.done = make(chan note, 10), make(chan struct{})
+	sent := make(chan wire.Request, 10)
+	go func() {
+		for {
+			var q wire.Request
+			if wire.Read(b, 1<<20, &q) != nil {
+				return
+			}
+			sent <- q
+		}
+	}()
+	opened := make(chan struct{}, 10)
+	u.open = func() (net.Conn, error) { opened <- struct{}{}; return nil, errors.New("no") }
+	// Keys before Ctrl-] go to the host, those in the menu and its questions do not.
+	u.key([]byte("ls\x1dug"))
+	if q := <-sent; string(q.Data) != "ls" || u.mode != menu {
+		t.Fatalf("%+v %v", q, u.mode)
+	}
+	u.key([]byte("u"))
+	u.key([]byte("/etc/host"))
+	u.draw()
+	if !strings.Contains(out.String(), "LOCAL file to send: /etc/host") {
+		t.Fatalf("%q", out.String())
+	}
+	// Not even with Enter and more in one piece does the rest answer the next question.
+	u.key([]byte("name\revil\r"))
+	if u.mode != askSendTo || string(u.input) != "" {
+		t.Fatalf("%v %q", u.mode, string(u.input))
+	}
+	// Whatever the host says, it cannot start, change or answer anything.
+	for _, r := range []wire.Reply{{Type: "upload", Text: "/etc/passwd"}, {Type: "download"}, {Type: wire.Doc}, {Type: wire.OK, Text: "x"}, {Type: wire.StateType, State: &wire.State{ID: 7, Phase: wire.Pending}}} {
+		u.receive(r)
+	}
+	if u.mode != askSendTo || u.local != "/etc/hostname" || len(opened) != 0 || len(sent) != 0 {
+		t.Fatalf("%v %q %d %d", u.mode, u.local, len(opened), len(sent))
+	}
+	u.key([]byte("x\r"))
+	<-opened
+	if n := <-u.notes; !n.done || !strings.Contains(n.text, "NOT COPIED") {
+		t.Fatalf("%+v", n)
+	}
+	u.key([]byte("y"))
+	if q := <-sent; string(q.Data) != "y" {
+		t.Fatalf("%+v", q)
+	}
+	u.key([]byte("\x1d"))
+	if u.key([]byte("\x1b")) || u.mode != watching {
+		t.Fatal("Esc does not leave the menu")
+	}
+	u.key([]byte("\x1d"))
+	if !u.key([]byte("d")) {
+		t.Fatal("cannot detach")
 	}
 }

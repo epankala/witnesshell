@@ -216,8 +216,14 @@ func (u *ui) title() string {
 	if len(st.Weak) > 0 {
 		s += " WEAK HOST "
 	}
+	if st.Download {
+		s += " DOWNLOAD ALLOWED "
+	}
 	return view.Escape(s + " " + st.Dir)
 }
+
+var prompts = map[mode]string{comment: "reject, because: ", askView: "view file: ", askSig: "check signature of: ", askHash: "sha256 of: ",
+	askSend: "LOCAL file to send: ", askSendTo: "to which file on the HOST: ", askGet: "file on the HOST to get: ", askGetTo: "save as LOCAL file: "}
 
 // drawPanel returns the panel and where its cursor is, if it has one.
 func (u *ui) drawPanel() (lines []string, cx, cursorRow int) {
@@ -228,11 +234,24 @@ func (u *ui) drawPanel() (lines []string, cx, cursorRow int) {
 	} else {
 		add(reverse, u.title())
 	}
+	prompt := prompts[u.mode]
+	asking := func() {
+		s := prompt + view.Escape(string(u.input))
+		if w := ansi.StringWidth(s); w >= u.cols {
+			s = ansi.TruncateLeft(s, w-u.cols+1, "")
+		}
+		cx, cursorRow = ansi.StringWidth(s), len(lines)
+		add(bold, s)
+	}
 	if u.actor {
-		switch u.st.Phase {
-		case wire.Running:
+		switch {
+		case u.mode == menu:
+			add(bold, "LOCAL MENU  [u]pload a file  [g]et a file  [d]etach  other keys: back")
+		case prompt != "":
+			asking()
+		case u.st.Phase == wire.Running:
 			add("", "running: what you type goes to the program")
-		case wire.Pending:
+		case u.st.Phase == wire.Pending:
 			add(bold, "waiting: "+view.Escape(strings.ReplaceAll(u.st.Text, "\n", " ⏎ "))+"   (Ctrl-C cancels)")
 		default:
 			line, x := u.draftLine()
@@ -253,15 +272,9 @@ func (u *ui) drawPanel() (lines []string, cx, cursorRow int) {
 		u.seenEnd = true
 	}
 	lines = append(lines, d[u.scroll:u.scroll+n]...)
-	prompt := map[mode]string{comment: "reject, because: ", askView: "view file: ", askSig: "check signature of: "}[u.mode]
 	switch {
 	case prompt != "":
-		s := prompt + view.Escape(string(u.input))
-		if w := ansi.StringWidth(s); w >= u.cols {
-			s = ansi.TruncateLeft(s, w-u.cols+1, "")
-		}
-		cx, cursorRow = ansi.StringWidth(s), len(lines)
-		add(bold, s)
+		asking()
 	case u.message != "":
 		add(bold, view.Escape(strings.TrimRight(strings.ReplaceAll(u.message, "\n", " | "), " |")))
 	case u.st.Phase != wire.Pending && u.st.Draft != "":
@@ -269,8 +282,11 @@ func (u *ui) drawPanel() (lines []string, cx, cursorRow int) {
 	default:
 		add("", view.Escape(u.st.Notice))
 	}
-	help := "[v]iew [s]ignature [q]uit"
+	help := "[v]iew [s]ignature [h]ash [q]uit"
 	if u.st.Phase == wire.Pending {
+		if u.st.Transfer {
+			help = "[o]pen [d]iff " + help
+		}
 		help = "[a]pprove [r]eject " + help
 		if u.scroll+n < len(d) {
 			help = "MORE: space  " + help

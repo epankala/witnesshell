@@ -46,12 +46,17 @@ type Config struct {
 	UDPPort           int      `toml:"udp_port"` // 0 disables QUIC
 	ExecDirs          []string `toml:"exec_dirs"`
 	RecordDir         string   `toml:"record_dir"`
+	AllowUpload       bool     `toml:"allow_upload"`
+	AllowDownload     bool     `toml:"allow_download"`
+	MaxTransfer       string   `toml:"max_transfer"` // of one file
+	maxTransfer       int64
 	detach            time.Duration
 }
 
 // LoadConfig reads a configuration file. A missing file means defaults.
 func LoadConfig(name string) (Config, error) {
-	c := Config{ApprovalsRequired: 1, UDPPort: 60001, DetachTimeout: "30m", ExecDirs: []string{"/usr"}, RecordDir: audit.DefaultDir}
+	c := Config{ApprovalsRequired: 1, UDPPort: 60001, DetachTimeout: "30m", ExecDirs: []string{"/usr"}, RecordDir: audit.DefaultDir,
+		AllowUpload: true, MaxTransfer: "1GiB"}
 	md, err := toml.DecodeFile(name, &c)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return c, err
@@ -68,6 +73,9 @@ func LoadConfig(name string) (Config, error) {
 	if c.UDPPort < 0 || c.UDPPort > 65535 {
 		return c, fmt.Errorf("%s: bad udp_port", name)
 	}
+	if c.maxTransfer, err = parseSize(c.MaxTransfer); err != nil {
+		return c, fmt.Errorf("%s: bad max_transfer: %w", name, err)
+	}
 	if !filepath.IsAbs(c.RecordDir) {
 		return c, fmt.Errorf("%s: record_dir must be an absolute path", name)
 	}
@@ -77,6 +85,21 @@ func LoadConfig(name string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+// parseSize reads a number of bytes such as "100MiB".
+func parseSize(s string) (int64, error) {
+	shift := 0
+	for i, u := range []string{"KiB", "MiB", "GiB", "TiB"} {
+		if n, ok := strings.CutSuffix(s, u); ok {
+			s, shift = n, 10*(i+1)
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 1 || n > 1<<50>>shift {
+		return 0, fmt.Errorf("%q is not a size such as 100MiB", s)
+	}
+	return n << shift, nil
 }
 
 // Daemon serves sessions.
@@ -89,6 +112,7 @@ type Daemon struct {
 	sessions []*session
 	starting int
 	conns    map[uint32]int
+	staged   int64 // bytes of files being copied
 	tokens   tokens
 	logins   logins
 	quic     *transport.Server // nil if disabled
@@ -103,6 +127,12 @@ func New(c Config, log *slog.Logger) (*Daemon, error) {
 	d := &Daemon{c: c, log: log, conns: map[uint32]int{}, store: &sign.Store{
 		Dir: sign.DefaultStoreDir, Keys: sign.KeyDir{Dir: sign.DefaultKeyDir}, LookupUID: launch.LookupUID}}
 	if err := d.store.Init(); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(d.stagingDir(), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(d.stagingDir(), 0o700); err != nil {
 		return nil, err
 	}
 	d.logins.life = c.detach
@@ -123,6 +153,8 @@ func New(c Config, log *slog.Logger) (*Daemon, error) {
 	}
 	return d, nil
 }
+
+func (d *Daemon) stagingDir() string { return d.store.Dir + "/staging" }
 
 // Listen opens the socket. Any user may connect; the kernel tells who they are.
 func Listen(name string) (*net.UnixListener, error) {
@@ -338,6 +370,9 @@ func (d *Daemon) serve(conn net.Conn, uid uint32) {
 			} else {
 				_ = wire.Write(conn, wire.Reply{Type: wire.OK})
 			}
+			return
+		case wire.Upload, wire.Download:
+			d.transfer(conn, u, q)
 			return
 		case wire.Actor, wire.Witness:
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Minute)) // the host check takes a while

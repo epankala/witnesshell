@@ -47,6 +47,7 @@ type leaderResp struct {
 	Dir      string
 	Exited   bool
 	SHA256   string // of the file that was looked at
+	Umask    int
 }
 
 // Leader is the body of the leader process.
@@ -101,7 +102,7 @@ func Leader() error {
 		if err != nil {
 			r.Err = err.Error()
 		}
-		r.Dir, r.Exited = s.Dir(), s.Exited()
+		r.Dir, r.Exited, r.Umask = s.Dir(), s.Exited(), s.Umask()
 		if err := enc.Encode(r); err != nil {
 			return err
 		}

@@ -34,6 +34,9 @@ type client struct {
 	dirty  chan struct{}   // the screen has changed
 	frame  func() (*wire.Frame, bool)
 	ver    uint64 // of the screen it has; session lock
+	// left is closed when the client has gone.
+	left    chan struct{}
+	hashing bool // session lock
 }
 
 type bulkConn interface {
@@ -47,7 +50,7 @@ func newClient(conn net.Conn, screen bulkConn, u launch.User, actor bool) *clien
 		_ = c.SetWriteBuffer(16 << 10)
 	}
 	return &client{conn: conn, screen: screen, user: u, actor: actor,
-		out: make(chan wire.Reply, 64), msgs: make(chan wire.Reply, 256), state: make(chan wire.Reply, 1), dirty: make(chan struct{}, 1)}
+		out: make(chan wire.Reply, 64), msgs: make(chan wire.Reply, 256), state: make(chan wire.Reply, 1), dirty: make(chan struct{}, 1), left: make(chan struct{})}
 }
 
 // send queues a message. A client that cannot keep up is dropped; it can
@@ -91,6 +94,7 @@ func (c *client) writeFrame(w bulkConn) error {
 
 // finish ends the client once what is in msgs was sent. Session lock held.
 func (c *client) finish() {
+	close(c.left)
 	close(c.msgs)
 	close(c.out)
 }
@@ -193,8 +197,11 @@ type session struct {
 	gate       *gate.Gate
 	keys       keys
 	checking   bool
-	serial     uint64 // of the prepared command
-	request    string // hash of the log entry of the pending request
+	serial     uint64           // of the prepared command
+	request    string           // hash of the log entry of the pending request
+	transfer   *pendingTransfer // that the pending request is about, if any
+	staging    bool             // a transfer is going on
+	umask      int
 	details    []string
 	warnings   []string
 	dir        string
@@ -215,7 +222,7 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 	if err != nil {
 		return nil, err
 	}
-	s := &session{d: d, actor: u, weak: weak, gate: g, since: d.nextStart(), pumped: make(chan struct{})}
+	s := &session{d: d, actor: u, weak: weak, gate: g, since: d.nextStart(), pumped: make(chan struct{}), umask: 0o022}
 	s.id = s.since.Format("20060102T150405.000Z")
 	s.log = d.log.With("session", s.id, "actor", u.Name)
 	s.rows, s.cols = clampSize(rows, cols)
@@ -380,6 +387,7 @@ func (s *session) end(why string) {
 		s.log.Info("request purged", "id", r.ID)
 		s.note(audit.Purged, audit.Data{"id": r.ID, "request_hash": s.request, "why": why}, true)
 	}
+	s.drop("the session is over")
 	if s.detach != nil {
 		s.detach.Stop()
 	}
@@ -500,7 +508,7 @@ func (s *session) resize(rows, cols uint16) {
 // broadcast sends the state to everyone. Lock held.
 func (s *session) broadcast() {
 	st := &wire.State{Session: s.id, Actor: s.actor.Name, Dir: s.dir, Rows: s.rows, Cols: s.cols,
-		Required: s.gate.Required(), Notice: s.notice, Weak: s.weak}
+		Required: s.gate.Required(), Notice: s.notice, Weak: s.weak, Download: s.d.c.AllowDownload}
 	st.Draft, st.Cursor = s.gate.Draft()
 	switch {
 	case s.checking:
@@ -510,7 +518,7 @@ func (s *session) broadcast() {
 	case s.gate.State() == gate.Pending:
 		st.Phase = wire.Pending
 		r, _ := s.gate.Pending()
-		st.ID, st.Text, st.Details, st.Warnings = r.ID, r.Text, s.details, s.warnings
+		st.ID, st.Text, st.Details, st.Warnings, st.Transfer = r.ID, r.Text, s.details, s.warnings, s.transfer != nil
 		for _, v := range r.Votes {
 			st.Votes = append(st.Votes, wire.VoteInfo{Name: s.d.userName(v.UID), Approve: v.Approve})
 		}
@@ -570,6 +578,7 @@ func (s *session) keyLocked(data []byte) (logout bool) {
 					s.log.Info("request cancelled", "id", r.ID)
 					s.note(audit.Cancelled, audit.Data{"id": r.ID, "request_hash": s.request}, true)
 					s.logged(s.audit.Marker("cancelled"))
+					s.drop("cancelled")
 					s.notice = "cancelled"
 				}
 			} else {
@@ -650,7 +659,7 @@ func (s *session) run(serial uint64, about audit.Data) {
 	}
 	_ = s.gate.Finished()
 	s.keys.reset()
-	s.dir = r.Dir
+	s.dir, s.umask = r.Dir, r.Umask
 	switch {
 	case err != nil:
 		s.notice = "the shell ended"
@@ -684,6 +693,7 @@ func (s *session) vote(c *client, q wire.Request) error {
 	}
 	var r gate.Request
 	var err error
+	outside := s.transfer != nil
 	if q.Approve {
 		r, err = s.gate.Approve(c.user.UID, q.ID)
 	} else {
@@ -701,6 +711,7 @@ func (s *session) vote(c *client, q wire.Request) error {
 	if ok = ok && s.own(c, audit.Vote, d); !ok {
 		if r.Outcome == gate.Approved {
 			_ = s.gate.Finished() // it must not run
+			s.drop("the session can no longer be logged")
 		}
 		return errors.New("the session can no longer be logged")
 	}
@@ -715,10 +726,16 @@ func (s *session) vote(c *client, q wire.Request) error {
 		}
 		if !ok || !s.logged(s.audit.Marker("approved by "+strings.Join(by, ", "))) {
 			_ = s.gate.Finished()
+			s.drop("the session can no longer be logged")
 			return errors.New("the session can no longer be logged")
 		}
-		go s.run(s.serial, run)
+		if outside {
+			s.approved(run)
+		} else {
+			go s.run(s.serial, run)
+		}
 	case gate.Rejected:
+		s.drop(fmt.Sprintf("rejected by %s: %s", c.user.Name, strings.TrimSpace(q.Text)))
 		s.logged(s.audit.Marker(fmt.Sprintf("rejected by %s: %s", c.user.Name, strings.TrimSpace(q.Text))))
 		s.notice = fmt.Sprintf("rejected by %s: %s", c.user.Name, strings.ReplaceAll(strings.TrimSpace(q.Text), "\n", " "))
 	}
@@ -806,6 +823,22 @@ func (s *session) serve(c *client) {
 				continue
 			}
 			s.reply(c, s.inspect(c, q, s.d.store))
+		case !c.actor && (q.Type == wire.Staged || q.Type == wire.Changes):
+			if len(c.out) > 16 {
+				s.reply(c, wire.Reply{Type: wire.Error, Text: "too many requests"})
+				continue
+			}
+			s.reply(c, s.showStaged(c, q))
+		case !c.actor && q.Type == wire.Sha256:
+			s.mu.Lock()
+			busy := c.hashing
+			c.hashing = true
+			s.mu.Unlock()
+			if busy {
+				s.reply(c, wire.Reply{Type: wire.Error, Text: "still busy with the last one"})
+				continue
+			}
+			go s.hash(c, q)
 		case !c.actor && q.Type == wire.Sign:
 			r := wire.Reply{Type: wire.OK, Text: "signed"}
 			if err := s.d.sign(c.user, q.Text); err != nil {

@@ -30,6 +30,8 @@ type Request struct {
 	ID      uint64 `json:",omitempty"`
 	Approve bool   `json:",omitempty"`
 	Text    string `json:",omitempty"` // comment, path or hash
+	Size    int64  `json:",omitempty"` // Upload
+	Hash    string `json:",omitempty"` // Upload: SHA-256 in hex
 	// Screen asks for frames on a separate stream with this name, if not 0.
 	Screen uint64 `json:",omitempty"`
 }
@@ -49,6 +51,12 @@ const (
 	Auth     = "auth"   // QUIC only, first of all: Text is the token
 	Resume   = "resume" // instead of Auth: Text is the secret of the login
 	Ping     = "ping"
+	Sha256   = "sha256" // witness: Text is a path
+	Staged   = "staged" // witness: show the file of the pending transfer
+	Changes  = "diff"   // witness: compare it with the file it replaces
+	// These begin a connection of their own. Text is a path on the host.
+	Upload   = "upload"   // the content follows
+	Download = "download" // the content comes back
 )
 
 // Reply is a message from the daemon.
@@ -59,6 +67,7 @@ type Reply struct {
 	State    *State    `json:",omitempty"`
 	Doc      *view.Doc `json:",omitempty"`
 	Frame    *Frame    `json:",omitempty"`
+	Size     int64     `json:",omitempty"` // Download: what follows; Text is its hash
 	CanStart bool      `json:",omitempty"` // Sessions
 }
 
@@ -118,6 +127,8 @@ type State struct {
 	ActorOnline         bool
 	Notice              string
 	Weak                []string // host problems that were overridden
+	Download            bool     // is allowed
+	Transfer            bool     // the pending request is one
 }
 
 // Frame is what changed on the screen. The first one a client gets is complete.

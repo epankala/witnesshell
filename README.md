@@ -34,6 +34,7 @@ The command is `witsh`; group, service and paths on the host are named
 [Security](#security) ·
 [Restrictions](#restrictions-of-the-shell) ·
 [Limits](#what-it-does-not-protect-against) ·
+[Copying files](#copying-files) ·
 [Logging](#logging-and-recording) ·
 [Status](#status) ·
 [Installing](#installing) ·
@@ -98,8 +99,8 @@ return to the list of sessions to witness another actor, if there is one.
 Witnesses never act with the actor's permissions. To let one read a private
 file, the actor shows it in the session or makes it readable.
 
-Actor and witnesses can look at files (`view`) and check signatures
-(`checksig`) **without approval**, with their own file permissions. Neither
+Actor and witnesses can look at files (`view`), hash them (`sha256`) and check
+signatures (`checksig`) **without approval**, with their own file permissions. Neither
 starts another program.
 
 ## Validation: what may run
@@ -133,7 +134,7 @@ enough; the actor's own never counts.
 
 ```sh
 ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n witnesshell deploy.sh
-# copy deploy.sh and deploy.sh.sig to the host, side by side
+# upload deploy.sh and deploy.sh.sig, side by side
 ```
 
 **On the host**: `witsh sign deploy.sh`, or `S` while viewing a file as a
@@ -214,7 +215,7 @@ refused rather than guessed.**
 | commands, pipes, `&&` `\|\|` `;` `&` | `$(...)`, backticks, `<(...)` |
 | `>` `>>` `<` `2>` `2>&1` `&>` | here-documents, descriptors above 2 |
 | `$NAME`, `$?`, quotes, `~`, `*`, `?` | `${x:-y}`, arithmetic, `{a,b}`, `[a-z]` |
-| `cd export unset umask exit view checksig` | functions, aliases, `if`, `for`, `while` |
+| `cd export unset umask exit view checksig sha256` | functions, aliases, `if`, `for`, `while` |
 | `jobs fg bg kill`, Ctrl-C, Ctrl-Z | `exec`, `eval`, `source` |
 
 - Everything is expanded **before** approval, so witnesses see the final
@@ -245,6 +246,29 @@ change does not go unnoticed.
 - A file or directory named in a command can change between approval and use.
 - One person with two accounts can witness themselves.
 - Other ways into the host, such as a console or an unrestricted admin account.
+
+## Copying files
+
+Ideally, the people who connect have everything locally already, and compare:
+
+```
+host$  sha256 app-2.4.tar.gz        # any size, no approval needed
+local$ sha256sum app-2.4.tar.gz
+```
+
+Otherwise **Ctrl-]** opens a menu of the client, with `witsh connect`:
+
+- **To the host:** the file is staged, witnesses see destination, size, SHA-256,
+  content and changes, and approve it like a command. Exactly that is written,
+  with the actor's permissions, never executable. It **cannot run** unless a
+  witness signs it.
+- **From the host: not permitted by default.** With `allow_download = true`, each
+  file needs approval, and everyone sees `DOWNLOAD ALLOWED`.
+- **Only the person at the client chooses local files.** The host can neither
+  start a transfer nor learn a local path, and nothing local is overwritten.
+
+Forbidding downloads does not stop anyone from copying text off the screen, or an
+approved program from using the network. That takes a firewall.
 
 ## Logging and recording
 
@@ -282,8 +306,8 @@ witnesshell-<session start>-witness-<name>.log
 | QUIC transport | ✅ done |
 | Reconnecting by itself | ✅ done |
 | Audit logs and recording | ✅ done |
-| File transfer: to the host with approval; from the host off by default | 🚧 next |
-| Hardening, packaging, releases | planned |
+| File transfer | ✅ done |
+| Hardening, packaging, releases | 🚧 next |
 
 The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
 audited by a third party.
@@ -328,7 +352,7 @@ On the host itself, `witsh attach` does the same.
 | Enter: submit | `a` approve, `r` reject |
 | Ctrl-C: cancel | Space, `b`: scroll |
 | Ctrl-D: log out | `v` view file, `s` check signature |
-| Ctrl-]: detach | `q` leave |
+| Ctrl-]: local menu, detach | `h` hash, `q` leave |
 
 Configuration, all optional, in `/etc/witnesshell/config.toml`:
 
@@ -339,6 +363,9 @@ detach_timeout     = "30m"
 exec_dirs          = ["/usr"]
 udp_port           = 60001      # 0 disables QUIC
 record_dir         = "/var/log/witnesshell"
+allow_upload       = true
+allow_download     = false
+max_transfer       = "1GiB"
 allow_weak_host    = false
 ```
 

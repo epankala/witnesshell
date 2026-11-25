@@ -159,6 +159,49 @@ func TestSubmitFree(t *testing.T) {
 	is(t, err, ErrPending)
 }
 
+func TestSubmitOutside(t *testing.T) {
+	g := newGate(t, 2)
+	ok(t, g.Insert("half a line"))
+	for _, bad := range []string{"", "a\nb", "a\x1bb", "a\u202eb", strings.Repeat("x", MaxCommandBytes+1)} {
+		if _, err := g.SubmitOutside(bad); err == nil {
+			t.Errorf("%.20q accepted", bad)
+		}
+	}
+	r, err := g.SubmitOutside("upload x")
+	ok(t, err)
+	_, err = g.SubmitOutside("upload y")
+	is(t, err, ErrPending)
+	is(t, g.Insert("x"), ErrPending)
+	_, err = g.Approve(1, r.ID)
+	ok(t, err)
+	state(t, g, Pending)
+	r, err = g.Approve(2, r.ID)
+	ok(t, err)
+	if r.Outcome != Approved || !r.Outside {
+		t.Fatalf("%+v", r)
+	}
+	state(t, g, Prompt) // input is never free
+	wantDraft(t, g, "half a line")
+	ok(t, g.Edit(HistoryPrev))
+	wantDraft(t, g, "half a line") // not a command, so not in the history
+	for _, end := range []string{"reject", "cancel"} {
+		r, err = g.SubmitOutside("upload x")
+		ok(t, err)
+		if end == "reject" {
+			_, err = g.Reject(1, r.ID, "no")
+		} else {
+			_, err = g.Cancel()
+		}
+		ok(t, err)
+		wantDraft(t, g, "half a line")
+	}
+	id := submit(t, g, "!").ID
+	_, err = g.Approve(1, r.ID)
+	is(t, err, ErrStale)
+	_, err = g.Approve(1, id)
+	ok(t, err)
+}
+
 func TestCancel(t *testing.T) {
 	g := newGate(t, 1)
 	_, err := g.Cancel()

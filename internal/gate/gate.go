@@ -98,6 +98,8 @@ type Request struct {
 	Text    string
 	Votes   []Vote
 	Outcome Outcome
+	// Outside marks a request that is not a command line, see SubmitOutside.
+	Outside bool
 }
 
 // Gate is the approval state machine of one session.
@@ -181,6 +183,25 @@ func (g *Gate) Submit() (Request, error) {
 	return g.snapshot(), nil
 }
 
+// SubmitOutside makes a pending request of something other than a command
+// line, such as a file transfer. The draft is left alone, and approval does not
+// free input: the caller does what was approved.
+func (g *Gate) SubmitOutside(text string) (Request, error) {
+	if err := g.atPrompt(); err != nil {
+		return Request{}, err
+	}
+	if len(text) > MaxCommandBytes {
+		return Request{}, ErrTooLong
+	}
+	if text == "" || strings.Contains(text, "\n") || !safeText(text) {
+		return Request{}, ErrUnsafeText
+	}
+	g.lastID++
+	g.req = Request{ID: g.lastID, Text: text, Outside: true}
+	g.state = Pending
+	return g.snapshot(), nil
+}
+
 // SubmitFree takes the draft without approval (D27). The caller must have
 // made sure that the text is such a command.
 func (g *Gate) SubmitFree() (string, error) {
@@ -209,6 +230,9 @@ func (g *Gate) Approve(uid uint32, id uint64) (Request, error) {
 	// Every vote on a pending request is an approval by a distinct uid,
 	// because a rejection resolves the request at once.
 	if len(g.req.Votes) >= g.required {
+		if g.req.Outside {
+			return g.resolve(Approved, Prompt), nil
+		}
 		g.history = append(g.history, g.req.Text)
 		return g.resolve(Approved, Running), nil
 	}
@@ -231,7 +255,9 @@ func (g *Gate) Reject(uid uint32, id uint64, comment string) (Request, error) {
 		return Request{}, ErrBadComment
 	}
 	g.req.Votes = append(g.req.Votes, Vote{UID: uid, Comment: comment})
-	g.draft = newDraft(g.req.Text)
+	if !g.req.Outside {
+		g.draft = newDraft(g.req.Text)
+	}
 	return g.resolve(Rejected, Prompt), nil
 }
 
@@ -240,7 +266,9 @@ func (g *Gate) Cancel() (Request, error) {
 	if err := g.needPending(); err != nil {
 		return Request{}, err
 	}
-	g.draft = newDraft(g.req.Text)
+	if !g.req.Outside {
+		g.draft = newDraft(g.req.Text)
+	}
 	return g.resolve(Cancelled, Prompt), nil
 }
 

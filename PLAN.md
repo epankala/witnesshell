@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 to M6 done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M7.
+> Status: M0 to M7 done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M8.
 
 ## 0. Decisions
 
@@ -102,7 +102,7 @@ only runs `quic 1`, which the bootstrap answers with
   started, witnesshell does nothing but the bootstrap. It must not be listed in
   `/etc/shells`, or users could change it with `chsh`.
 - Commands, scp, sftp and forwarding are refused. Files reach the host through
-  approved commands, and from M7 as approved transfers (§4.8).
+  approved commands or as approved transfers (§4.8).
 - Keys are root-owned files in `/etc/ssh/authorized_keys/`.
 - **Other terminals are hidden** from a session's programs by a private
   `/dev/pts`. (M3 leaked that mount to the host, so that later logins shared
@@ -298,7 +298,7 @@ actor with it (D17). Approved root (`sudo`) can undo everything.
 |---|---|
 | `view FILE` | built-in pager, like `less`; content, owner, mode and SHA-256 |
 | `checksig FILE` | trusted / signed by whom / neither, and the SHA-256 |
-| `sha256 FILE...` | size and SHA-256 in the format of `sha256sum`, **of any size** (D36, planned: M7) |
+| `sha256 FILE...` | size and SHA-256 in the format of `sha256sum`, **of any size** (D36); the size is a comment line that `sha256sum -c` skips |
 
 None starts a program. Rules:
 - They run with the **caller's own** file permissions, never the daemon's:
@@ -339,7 +339,7 @@ None starts a program. Rules:
 - Logging out (Ctrl-D or `exit`) needs no approval. Witnesses are returned to
   the list of sessions (D32); keys typed as the session ended are dropped.
 
-### 4.8 File transfer (D34, D35; planned: M7)
+### 4.8 File transfer (D34, D35)
 
 **The preferred way is not to transfer** (D36). The people who connect have the
 artifacts locally, from git or a build system, and compare:
@@ -358,17 +358,25 @@ hostile host could fetch `~/.ssh/id_ed25519`. The local path is not sent.
 #### Client to host (D34)
 1. The actor chooses a local file and a destination on the host.
 2. The client sends size, SHA-256 and content on a separate QUIC stream. The
-   daemon keeps it in a root-only staging directory on a `noexec` filesystem.
-   It is not yet a file of the actor's.
+   daemon stages it in a file **without a name** (`O_TMPFILE`), which no other
+   process can reach and a crash removes.
 3. The daemon makes a request of it, which goes through the normal approval
    (K-of-N, veto, comment). Witnesses see destination, size and SHA-256,
    whether a file is replaced and the old one's SHA-256, and can **view the
-   staged content**; for a text file that is replaced, a diff.
+   staged content** (`o`); for a text file that is replaced, a diff (`d`). The
+   old file is read with the *witness's* permissions (D31).
 4. Once approved, the daemon writes exactly the staged content **with the
    actor's permissions**: to a new file beside the destination, then renamed.
    Links are not followed at the destination, and `/proc` and devices are
-   refused. Mode 0644 less the umask, never executable or setuid.
-5. Otherwise, or at logout, it is deleted.
+   refused. Never executable or setuid; a new file gets 0666 less the umask, a
+   replaced file's other permissions are kept, so that a private one stays so.
+   If the destination is no longer what was approved (other directory, new
+   file there, old file changed), nothing is written: the swap is atomic and is
+   undone.
+5. Otherwise, at logout, or if the client goes away first, it is deleted.
+
+A transfer waits until the session is at its prompt, leaves the draft alone, and
+never frees input. One per session at a time.
 
 Consequences:
 - An uploaded file belongs to the actor, so it is **untrusted and cannot run**
@@ -395,17 +403,12 @@ makes it a decision that is recorded. It cannot stop someone from copying text
 off the screen (`base64 FILE`), or an approved program from sending data over
 the network. Preventing that needs a firewall on the host.
 
-Neither works in a plain `ssh` session, which has no witsh client at the other
-end. All transfers, refused ones too, are in the logs (§8) with path, size and
+Neither works in a plain `ssh` session or with `attach`, which have no witsh
+client at the other end. All transfers, refused ones too, are in the logs (§8) with path, size and
 SHA-256; the content is not.
 
-Open:
-- May **witnesses** upload, for example a `.sig` file? *Default: no, the actor
-  does; they sign on the host or hand the file over.*
-- Should downloads, when enabled, be limited to configured directories?
-  *Default: no, approval decides.*
-- Should uploads be possible to switch off too? *Default: yes,
-  `allow_upload = true`.*
+Defaults chosen, not confirmed yet: witnesses cannot upload; downloads, when
+allowed, are not limited to directories; `allow_upload = false` turns uploads off.
 
 ## 5. Authorisation & config (D5, D13, D14)
 
@@ -420,9 +423,9 @@ udp_port           = 60001    # 0 disables QUIC
 record_dir         = "/var/log/witnesshell"
 exec_dirs          = ["/usr"]  # where Landlock allows programs
 allow_weak_host    = false    # skip the host checks of §4.5
-allow_upload       = true     # client to host, with approval (M7)
-allow_download     = false    # host to client, with approval (M7)
-max_transfer       = "1GiB"   # of one file (M7)
+allow_upload       = true     # client to host, with approval
+allow_download     = false    # host to client, with approval
+max_transfer       = "1GiB"   # of one file; four times as much in all
 ```
 
 Known limit: one person with two accounts can witness themselves. Account
@@ -588,6 +591,7 @@ internal/runner/        the shell: prepare, run, job control, builtins
 internal/session/       joins gate + shell, VT emulator
 internal/gate/          draft editor, request state machine, votes, K-of-N, veto
 internal/view/          read-only pager and signature check (D27)
+internal/transfer/      staging, placing, diff, the client's side (§4.8)
 internal/audit/         hash-chained actor and witness logs, asciicast writer
 internal/ui/            actor status bar, witness panel
 deploy/                 systemd unit, sshd_config snippet, example config.toml
