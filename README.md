@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/witnesshell-wordmark-dark.svg">
+    <img src="assets/logo/witnesshell-wordmark-light.svg" alt="witnesshell logo: a shell full of watching eyes, in flames" width="640">
+  </picture>
+</p>
+
 # witnesshell
 
 **A remote shell where nothing runs until someone else has approved it.**
