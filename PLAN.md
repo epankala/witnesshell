@@ -40,6 +40,9 @@
 | D31 | A witness **never acts with the actor's permissions**. To show a private file, the actor displays it in the session or makes it readable to the witness |
 | D32 | **Everything ends at logout.** Its witnesses are returned to the list of sessions, where they can witness another actor if there is one |
 | D33 | The binary and command are **`witsh`**; the project, group, service, config and state paths, signature namespace and protocol keep the name witnesshell. `wish` is taken by Tcl/Tk |
+| D34 | **Files can be copied from the client to the host** (§4.8) |
+| D35 | **Copying from the host to the client is optional and NOT permitted by default.** Only root can enable it, in the config |
+| D36 | Ideally the connecting machines **already have all the data** the host has and look at it locally. On the host, content can always be viewed, and the **SHA-256 of a file** (big or binary) obtained to compare with local artifacts (`view`, `sha256`; §4.6) |
 
 ## 1. Goal
 
@@ -99,7 +102,7 @@ only runs `quic 1`, which the bootstrap answers with
   started, witnesshell does nothing but the bootstrap. It must not be listed in
   `/etc/shells`, or users could change it with `chsh`.
 - Commands, scp, sftp and forwarding are refused. Files reach the host through
-  approved commands.
+  approved commands, and from M7 as approved transfers (§4.8).
 - Keys are root-owned files in `/etc/ssh/authorized_keys/`.
 - **Other terminals are hidden** from a session's programs by a private
   `/dev/pts`. (M3 leaked that mount to the host, so that later logins shared
@@ -295,8 +298,9 @@ actor with it (D17). Approved root (`sudo`) can undo everything.
 |---|---|
 | `view FILE` | built-in pager, like `less`; content, owner, mode and SHA-256 |
 | `checksig FILE` | trusted / signed by whom / neither, and the SHA-256 |
+| `sha256 FILE...` | size and SHA-256 in the format of `sha256sum`, **of any size** (D36, planned: M7) |
 
-Both start no program. Rules:
+None starts a program. Rules:
 - They run with the **caller's own** file permissions, never the daemon's:
   the actor's view as the actor, a witness's view as that witness. Files only
   root may read still need an approved `sudo` command.
@@ -311,6 +315,9 @@ Both start no program. Rules:
 - The actor's view is part of the mirrored screen and is recorded. A witness's
   view is private to that witness, works while a request is pending, and
   resolves relative paths from the actor's current directory.
+- `view` and `checksig` stop at 256 MB, so big files need `sha256`. It reads with
+  the caller's permissions, shows progress, can be cancelled
+  with Ctrl-C, and does not hold up approvals. Witnesses have it too.
 - A viewed file can change before a command uses it. The SHA-256 lets a
   witness compare; for signed files the stored copy runs (§4.4).
 
@@ -332,6 +339,74 @@ Both start no program. Rules:
 - Logging out (Ctrl-D or `exit`) needs no approval. Witnesses are returned to
   the list of sessions (D32); keys typed as the session ended are dropped.
 
+### 4.8 File transfer (D34, D35; planned: M7)
+
+**The preferred way is not to transfer** (D36). The people who connect have the
+artifacts locally, from git or a build system, and compare:
+
+```
+host$ sha256 app-2.4.tar.gz            # no approval needed
+local$ sha256sum app-2.4.tar.gz
+```
+
+**Rule for both directions: only the person at the client chooses local
+files.** A transfer is started in the client's own menu, which opens with
+Ctrl-] and is not part of the session. The host, programs on it, and text on
+the screen can neither start a transfer nor name a local path. Otherwise a
+hostile host could fetch `~/.ssh/id_ed25519`. The local path is not sent.
+
+#### Client to host (D34)
+1. The actor chooses a local file and a destination on the host.
+2. The client sends size, SHA-256 and content on a separate QUIC stream. The
+   daemon keeps it in a root-only staging directory on a `noexec` filesystem.
+   It is not yet a file of the actor's.
+3. The daemon makes a request of it, which goes through the normal approval
+   (K-of-N, veto, comment). Witnesses see destination, size and SHA-256,
+   whether a file is replaced and the old one's SHA-256, and can **view the
+   staged content**; for a text file that is replaced, a diff.
+4. Once approved, the daemon writes exactly the staged content **with the
+   actor's permissions**: to a new file beside the destination, then renamed.
+   Links are not followed at the destination, and `/proc` and devices are
+   refused. Mode 0644 less the umask, never executable or setuid.
+5. Otherwise, or at logout, it is deleted.
+
+Consequences:
+- An uploaded file belongs to the actor, so it is **untrusted and cannot run**
+  unless a witness signs it (D18, D19). Uploading `X.sig` beside `X` is how
+  off-host signatures reach the host.
+- Limits in the config: size of a file, and space staged per user and in all,
+  so that nobody can fill the disk.
+- One file per transfer in the first version; no directories, no resuming.
+
+#### Host to client (D35)
+- `allow_download = false` is the default. The daemon refuses; hiding it in the
+  client would not be enough.
+- When enabled, **each download is a request with the same approval**.
+  Witnesses see path, size and SHA-256.
+- The file is opened with the **actor's** permissions (root's files need an
+  approved `sudo` command first), and a copy is staged when the request is
+  made, so that what was approved is what is sent.
+- The client asks for the local destination itself, never overwrites, never
+  makes it executable, and checks the SHA-256.
+- The title shows `DOWNLOAD ALLOWED` to everyone, like `WEAK HOST`.
+
+**What this does not do.** Forbidding downloads removes the convenient way and
+makes it a decision that is recorded. It cannot stop someone from copying text
+off the screen (`base64 FILE`), or an approved program from sending data over
+the network. Preventing that needs a firewall on the host.
+
+Neither works in a plain `ssh` session, which has no witsh client at the other
+end. All transfers, refused ones too, are in the logs (§8) with path, size and
+SHA-256; the content is not.
+
+Open:
+- May **witnesses** upload, for example a `.sig` file? *Default: no, the actor
+  does; they sign on the host or hand the file over.*
+- Should downloads, when enabled, be limited to configured directories?
+  *Default: no, approval decides.*
+- Should uploads be possible to switch off too? *Default: yes,
+  `allow_upload = true`.*
+
 ## 5. Authorisation & config (D5, D13, D14)
 
 Any member of group `witnesshell` who logs in may witness any session they
@@ -345,6 +420,9 @@ udp_port           = 60001    # 0 disables QUIC
 record_dir         = "/var/log/witnesshell"   # M6
 exec_dirs          = ["/usr"]  # where Landlock allows programs
 allow_weak_host    = false    # skip the host checks of §4.5
+allow_upload       = true     # client to host, with approval (M7)
+allow_download     = false    # host to client, with approval (M7)
+max_transfer       = "1GiB"   # of one file (M7)
 ```
 
 Known limit: one person with two accounts can witness themselves. Account
@@ -434,7 +512,8 @@ gives two sessions the same start time. Files are owned by root, mode 0600.
 | Joins and leaves | all witnesses | own |
 | Request text, resolved program, SHA-256, outcome | yes | yes, while joined |
 | Votes and comments (uid, time) | all | own |
-| `view`, `checksig`: path, SHA-256, result (not content) | own | own |
+| `view`, `checksig`, `sha256`: path, SHA-256, result (not content) | own | own |
+| Transfers (§4.8): direction, host path, size, SHA-256, outcome | yes | yes, while joined |
 | Command start, end, exit status; queue purge | yes | no |
 
 Each entry carries the SHA-256 of the previous one, forming a chain per file.
@@ -513,7 +592,8 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
 | M4 | QUIC | QUIC transport, cert pinning, tokens; works between two machines |
 | M5 | Resilience | resume tokens, VT screen resync, 30 min detach → logout; e2e with 30 % loss and a client IP change |
 | M6 | Audit & recording | separate hash-chained actor and witness logs, asciicast with markers, `audit verify`; replay checked with `asciinema play` |
-| M7 | Hardening & release | fuzz proto decoder, privilege-drop review, systemd unit, README (incl. D16 git-diff rule, §3.2 warning), release binaries |
+| M7 | File transfer | `sha256`; upload with staging, approval and diff; download, off by default; VM tests: the host cannot read or write local files, uploads cannot run, staged content cannot be swapped, limits hold, downloads refused by default |
+| M8 | Hardening & release | fuzz proto decoder, privilege-drop review, systemd unit, README (incl. D16 git-diff rule, §3.2 warning), release binaries |
 
 ## 12. Known limitations
 
@@ -523,5 +603,7 @@ test/e2e/               docker compose: host + 3 users; tc netem loss; IP change
   scriptable program then does (§4.5).
 - One person with two accounts can witness themselves (§5).
 - UDP must be reachable on the host (D8). There is no TCP fallback in v1.
+- Forbidding downloads does not stop copying off the screen or sending data
+  over the network (§4.8).
 - The root daemon is security-critical: keep it small, fuzz input, and
   drop privileges in the child before exec.

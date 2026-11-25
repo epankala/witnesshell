@@ -275,6 +275,7 @@ secrets included.
 | QUIC transport | ✅ done |
 | Reconnecting by itself | ✅ done |
 | Audit logs and recording | 🚧 next |
+| File transfer: to the host with approval; from the host off by default | planned |
 | Hardening, packaging, releases | planned |
 
 The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
