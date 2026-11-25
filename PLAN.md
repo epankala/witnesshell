@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 to M4 done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M5.
+> Status: M0 to M5 done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M6.
 
 ## 0. Decisions
 
@@ -323,14 +323,11 @@ Both start no program. Rules:
   any session can; hosts must not offer that to actors.
 - **Nothing outlives a session**: its cgroup is killed, `nohup` or not.
   (`sudo systemd-run` escapes; root can.)
-- **Screens are drawn from a terminal emulator**, cell by cell. Programs cannot
+- **Screens are drawn from rows of text** (§6.1). Programs cannot
   paint over the approval panel or send escape sequences to anyone's terminal.
 - Witnesses must page to the end of a request, and it must have been visible
   0.7 s, before `a` counts. That is the client's rule, against mistakes.
-- State overtakes screen output. A client that falls behind gets a fresh
-  screen; it neither delays others nor is dropped.
-- After reconnecting, the screen is rebuilt from the last 64 KB of output,
-  which may be incomplete until M5.
+- State overtakes the screen (§6.1).
 - Logging out (Ctrl-D or `exit`) needs no approval. Witnesses are returned to
   the list of sessions (D32); keys typed as the session ended are dropped.
 
@@ -369,18 +366,31 @@ management on the host has to prevent that.
   lost there do not delay requests, votes and state.
 - Receive windows are small, since what is in flight cannot be overtaken.
 - Keepalive every 3 s; idle timeout 15 s. No 0-RTT and no session tickets.
-- Until M5, a lost connection ends the client; `connect` again returns to the
-  session.
-- **Reconnect** (D8: no seamless roaming needed): when the connection
-  drops, the client retries with its **resume token**, from the new IP if
-  that changed, without ssh. The server keeps a **VT emulator** per
-  session and sends the current screen on resume (as mosh does), then the
-  live stream continues. Control messages have sequence numbers.
-- The actor UI shows `connection lost — reconnecting (0:12)`. After 30 min
-  without the actor the server treats it as logout (D13). Witnesses can
-  reconnect at any time while the session exists.
-- Optional later: if the resume token has expired, the client automatically
-  runs the ssh bootstrap again.
+- **Reconnect** (D8, D13): when the connection breaks, the client makes it
+  again, from whatever address it then has, without ssh. A login has a secret
+  that the server sends once over the pinned connection; it works until the
+  user quits, or until the login has been without a connection for
+  `detach_timeout`. Coming back closes the login's old connection. A restarted
+  daemon has another certificate, so clients refuse it and ask for a new login.
+- While there is no connection, keys and votes are refused, not kept: they were
+  meant for what was on the screen then. What was on its way when the connection
+  broke may or may not have arrived; nothing is sent twice.
+- The client pings every 3 s. It shows `NO ANSWER` after 7 s without any
+  message, and `CONNECTION LOST, reconnecting 0:12` once QUIC gives up (15 s).
+
+### 6.1 The screen
+- **One emulator per session, on the server, in a process of its own**
+  (`internal/screen`): user nobody, no new privileges, no files but two pipes,
+  in the session's cgroup. The root daemon does not parse what programs print.
+  If it dies, or takes over 10 s for a piece of output, a new one starts with an
+  empty screen and everyone is told.
+- **Clients get rows, not output.** The daemon keeps the current rows and the
+  version in which each last changed. A client gets the rows it lacks whenever
+  it can take them, so a slow one skips states instead of falling behind, and
+  one that reconnects has exactly the current screen.
+- Programs run as fast as the emulator (about 100,000 lines per second).
+- The client accepts text and SGR styles only and checks widths, so not even a
+  hostile host can send other sequences to a user's terminal.
 
 ## 7. User interfaces
 
@@ -473,6 +483,7 @@ cmd/witnesshell/        one binary: connect | bootstrap | daemon | sessions | au
 internal/wire/          messages, protocol version
 internal/transport/     QUIC server/client, cert pinning, resume tokens
 internal/bootstrap/     ssh exec, role menu, handshake line
+internal/screen/         terminal emulator process (§6.1)
 internal/daemon/        unix socket API, SO_PEERCRED, session registry, max_sessions
 internal/pty/           pseudo-terminals
 internal/lang/          parse, refuse, expand into an exact execution plan

@@ -15,6 +15,8 @@ import (
 	"witnesshell/internal/wire"
 )
 
+var ends = make(chan bool, 100)
+
 func serve(t *testing.T) (*Server, string) {
 	t.Helper()
 	s, err := Listen(0)
@@ -23,11 +25,11 @@ func serve(t *testing.T) (*Server, string) {
 	}
 	t.Cleanup(s.Close)
 	go func() {
-		_ = s.Serve(func(tok string) (uint32, error) {
-			if tok != "good" {
-				return 0, errors.New("bad token")
+		_ = s.Serve(func(q wire.Request, _ func()) (Accepted, error) {
+			if q.Text != "good" {
+				return Accepted{}, errors.New("bad token")
 			}
-			return 42, nil
+			return Accepted{42, "secret", func(quit bool) { ends <- quit }}, nil
 		}, func(st *Stream, uid uint32) {
 			defer st.Close()
 			var q wire.Request
@@ -51,7 +53,7 @@ func dial(t *testing.T, addr, fp, tok string) (*Client, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c, err := Dial(ctx, addr, fp, tok)
+	c, err := Dial(ctx, addr, fp, wire.Request{Type: wire.Auth, Text: tok})
 	if err == nil {
 		t.Cleanup(c.Close)
 	}
@@ -92,8 +94,45 @@ func TestStreams(t *testing.T) {
 	}
 }
 
+func TestEnded(t *testing.T) {
+	s, addr := serve(t)
+	for _, quit := range []bool{true, false} {
+		c, err := dial(t, addr, s.Fingerprint, "good")
+		if err != nil || c.Secret != "secret" || !c.Alive() {
+			t.Fatal(err)
+		}
+		for len(ends) > 0 {
+			<-ends
+		}
+		if quit {
+			c.Close()
+		} else {
+			c.Drop()
+		}
+		select {
+		case got := <-ends:
+			if got != quit {
+				t.Errorf("quit = %v, want %v", got, quit)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("end not noticed")
+		}
+		if c.Alive() {
+			t.Error("still alive")
+		}
+	}
+}
+
 func TestRefused(t *testing.T) {
 	s, addr := serve(t)
+	for _, tok := range []string{"bad", ""} {
+		if _, err := dial(t, addr, s.Fingerprint, tok); !errors.Is(err, ErrRefused) {
+			t.Error(err)
+		}
+	}
+	if _, err := dial(t, addr, strings.Repeat("0", 64), "good"); !errors.Is(err, ErrRefused) {
+		t.Error(err)
+	}
 	if _, err := dial(t, addr, s.Fingerprint, "bad"); err == nil || !strings.Contains(err.Error(), "bad token") {
 		t.Error(err)
 	}

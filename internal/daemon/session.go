@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -21,19 +20,18 @@ import (
 	"witnesshell/internal/wire"
 )
 
-// replaySize is how much output a new client gets to rebuild the screen.
-const replaySize = 64 << 10
-
 // client is one connection that has joined a session.
 type client struct {
-	conn    net.Conn
-	screen  bulkConn // carries out; nil if conn does
-	user    launch.User
-	actor   bool
-	out     chan wire.Reply // bulk: output and viewed files
-	msgs    chan wire.Reply
-	state   chan wire.Reply // the latest state
-	lagging bool            // output was skipped; see output
+	conn   net.Conn
+	screen bulkConn // carries frames and out; nil if conn does
+	user   launch.User
+	actor  bool
+	out    chan wire.Reply // bulk: viewed files
+	msgs   chan wire.Reply
+	state  chan wire.Reply // the latest state
+	dirty  chan struct{}   // the screen has changed
+	frame  func() (*wire.Frame, bool)
+	ver    uint64 // of the screen it has; session lock
 }
 
 type bulkConn interface {
@@ -47,14 +45,14 @@ func newClient(conn net.Conn, screen bulkConn, u launch.User, actor bool) *clien
 		_ = c.SetWriteBuffer(16 << 10)
 	}
 	return &client{conn: conn, screen: screen, user: u, actor: actor,
-		out: make(chan wire.Reply, 1024), msgs: make(chan wire.Reply, 256), state: make(chan wire.Reply, 1)}
+		out: make(chan wire.Reply, 64), msgs: make(chan wire.Reply, 256), state: make(chan wire.Reply, 1), dirty: make(chan struct{}, 1)}
 }
 
 // send queues a message. A client that cannot keep up is dropped; it can
 // reconnect. Session lock held.
 func (c *client) send(r wire.Reply) {
 	q := c.msgs
-	if r.Type == wire.Output || r.Type == wire.Doc {
+	if r.Type == wire.Doc {
 		q = c.out
 	}
 	select {
@@ -73,6 +71,22 @@ func (c *client) sendState(r wire.Reply) {
 	c.state <- r
 }
 
+// changed notes that there is a new frame. A client that is slow gets fewer.
+func (c *client) changed() {
+	select {
+	case c.dirty <- struct{}{}:
+	default:
+	}
+}
+
+func (c *client) writeFrame(w bulkConn) error {
+	f, ok := c.frame()
+	if !ok {
+		return nil
+	}
+	return writeTo(w, wire.Reply{Type: wire.FrameType, Frame: f})
+}
+
 // finish ends the client once what is in msgs was sent. Session lock held.
 func (c *client) finish() {
 	close(c.msgs)
@@ -85,7 +99,8 @@ func writeTo(w bulkConn, r wire.Reply) error {
 }
 
 // writeLoop sends queued messages until finish is called. State and messages
-// go before output, or do not wait for it at all if it has its own stream.
+// go before frames, or do not wait for them at all if they have their own
+// stream.
 func (c *client) writeLoop() {
 	defer func() {
 		_ = c.conn.Close()
@@ -94,9 +109,9 @@ func (c *client) writeLoop() {
 		for range c.out {
 		}
 	}()
-	out := c.out
+	out, dirty := c.out, c.dirty
 	if c.screen != nil {
-		out = nil
+		out, dirty = nil, nil
 		go c.screenLoop()
 	}
 	for {
@@ -112,9 +127,14 @@ func (c *client) writeLoop() {
 				select {
 				case r = <-c.state:
 				case r, ok = <-c.msgs:
+				case <-dirty:
+					if c.writeFrame(c.conn) != nil {
+						return
+					}
+					continue
 				case r, ok = <-out:
 					if !ok { // msgs is closed too, and may hold the farewell
-						out, ok = nil, true
+						out, dirty, ok = nil, nil, true
 						continue
 					}
 				}
@@ -128,17 +148,27 @@ func (c *client) writeLoop() {
 
 func (c *client) screenLoop() {
 	defer func() {
+		if w, ok := c.screen.(io.Closer); ok {
+			_ = w.Close()
+		}
 		for range c.out {
 		}
 	}()
-	for r := range c.out {
-		if writeTo(c.screen, r) != nil {
+	for {
+		var err error
+		select {
+		case <-c.dirty:
+			err = c.writeFrame(c.screen)
+		case r, ok := <-c.out:
+			if !ok {
+				return
+			}
+			err = writeTo(c.screen, r)
+		}
+		if err != nil {
 			_ = c.conn.Close()
 			return
 		}
-	}
-	if w, ok := c.screen.(io.Closer); ok {
-		_ = w.Close()
 	}
 }
 
@@ -153,6 +183,7 @@ type session struct {
 	ptm    *os.File
 	leader *leader
 	cgroup string
+	proc   *screenProc
 
 	mu         sync.Mutex
 	gate       *gate.Gate
@@ -163,7 +194,7 @@ type session struct {
 	warnings   []string
 	dir        string
 	notice     string
-	replay     []byte
+	screen     screenState
 	rows, cols uint16
 	clients    []*client
 	detach     *time.Timer
@@ -200,6 +231,19 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 	if err != nil {
 		return fail(err)
 	}
+	s.proc = &screenProc{cgroup: s.cgroup, onFrame: s.newFrame, onLost: s.screenLost, size: func() (uint16, uint16) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.rows, s.cols
+	}}
+	s.proc.mu.Lock()
+	err = s.proc.start()
+	s.proc.mu.Unlock()
+	if err != nil {
+		_ = s.ptm.Close()
+		_ = s.leader.in.Close()
+		return fail(err)
+	}
 	if len(weak) > 0 {
 		s.notice = "this host does not meet the requirements; protection is weaker"
 	}
@@ -227,22 +271,13 @@ func (s *session) removeCgroup() {
 	s.log.Error("cannot remove cgroup", "path", s.cgroup)
 }
 
-// pump copies terminal output to the clients.
+// pump feeds terminal output to the screen.
 func (s *session) pump() {
 	b := make([]byte, 32<<10)
 	for {
 		n, err := s.ptm.Read(b)
 		if n > 0 {
-			s.mu.Lock()
-			data := bytes.Clone(b[:n])
-			s.replay = append(s.replay, data...)
-			if len(s.replay) > 2*replaySize {
-				s.replay = bytes.Clone(s.replay[len(s.replay)-replaySize:])
-			}
-			for _, c := range s.clients {
-				s.output(c, data)
-			}
-			s.mu.Unlock()
+			s.proc.output(b[:n])
 		}
 		if err != nil {
 			return
@@ -250,40 +285,25 @@ func (s *session) pump() {
 	}
 }
 
-// Output queue lengths at which a client counts as behind, and as caught up.
-const (
-	behind   = 16
-	caughtUp = 4
-)
-
-// output sends terminal output to a client. One that cannot keep up misses
-// some and then gets a fresh screen, so it delays nobody. Lock held.
-func (s *session) output(c *client, data []byte) {
-	if c.lagging {
-		return
+// newFrame takes a frame from the screen process.
+func (s *session) newFrame(f *wire.Frame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.screen.apply(f)
+	for _, c := range s.clients {
+		c.changed()
 	}
-	if len(c.out) < behind {
-		c.send(wire.Reply{Type: wire.Output, Data: data})
-		return
-	}
-	c.lagging = true
-	s.catchUp(c)
 }
 
-func (s *session) catchUp(c *client) {
-	time.AfterFunc(50*time.Millisecond, func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if !slices.Contains(s.clients, c) {
-			return
-		}
-		if len(c.out) > caughtUp {
-			s.catchUp(c)
-			return
-		}
-		c.lagging = false
-		c.send(wire.Reply{Type: wire.Output, Data: bytes.Clone(s.replay), Reset: true})
-	})
+func (s *session) screenLost(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.over {
+		return
+	}
+	s.log.Error("screen lost", "err", err)
+	s.notice = "the screen could not be shown and was reset"
+	s.broadcast()
 }
 
 // end closes the session. Waiting commands are purged (D6).
@@ -312,6 +332,7 @@ func (s *session) end(why string) {
 	s.clients = nil
 	s.mu.Unlock()
 	s.log.Info("session ended", "why", why)
+	s.proc.close()
 	_ = s.leader.in.Close() // lets an idle leader hang up its jobs
 	_ = s.ptm.Close()       // hangs up the foreground job
 	select {
@@ -347,7 +368,17 @@ func (s *session) join(c *client, rows, cols uint16) error {
 	}
 	s.clients = append(s.clients, c)
 	s.log.Info("joined", "user", c.user.Name, "as_actor", c.actor)
-	c.send(wire.Reply{Type: wire.Output, Data: bytes.Clone(s.replay), Reset: true})
+	c.frame = func() (*wire.Frame, bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.screen.ver == c.ver {
+			return nil, false
+		}
+		f, v := s.screen.since(c.ver)
+		c.ver = v
+		return f, true
+	}
+	c.changed()
 	s.broadcast()
 	return nil
 }
@@ -380,6 +411,7 @@ func (s *session) leave(c *client) {
 func (s *session) resize(rows, cols uint16) {
 	s.rows, s.cols = clampSize(rows, cols)
 	_ = pty.Resize(s.ptm, s.rows, s.cols)
+	go s.proc.resize()
 }
 
 // broadcast sends the state to everyone. Lock held.
@@ -628,6 +660,8 @@ func (s *session) serve(c *client) {
 				s.broadcast()
 			}
 			s.mu.Unlock()
+		case q.Type == wire.Ping:
+			s.reply(c, wire.Reply{Type: wire.Pong})
 		case !c.actor && q.Type == wire.Vote:
 			if err := s.vote(c, q); err != nil {
 				s.reply(c, wire.Reply{Type: wire.Error, Text: err.Error()})

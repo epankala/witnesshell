@@ -1,7 +1,7 @@
-// Package ui is the client's terminal interface. The session's screen is
-// drawn from an emulator, cell by cell, above a panel that only this package
-// writes to. Programs can therefore neither imitate the panel nor send
-// commands to the user's terminal.
+// Package ui is the client's terminal interface. The session's screen comes as
+// rows of text and is drawn above a panel that only this package writes to.
+// Programs can therefore neither imitate the panel nor send commands to the
+// user's terminal.
 package ui
 
 import (
@@ -15,11 +15,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/vt"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
+	"witnesshell/internal/transport"
 	"witnesshell/internal/view"
 	"witnesshell/internal/wire"
 )
@@ -50,9 +49,14 @@ type ui struct {
 	rows  int
 	cols  int
 
-	em    *vt.Emulator
+	frame wire.Frame   // without Lines
+	lines [][]wire.Run // the screen
 	st    wire.State
-	modes map[int]bool // terminal modes programs have switched on
+
+	retry   bool      // a lost connection is made again
+	lost    time.Time // since when there is none; zero if there is one
+	heard   time.Time // when something last arrived
+	joining bool      // no state has come over this connection yet
 
 	mode    mode
 	input   []rune
@@ -65,7 +69,6 @@ type ui struct {
 	bell    bool
 	prev    []string
 	real    map[int]bool // modes set on the user's terminal
-	early   []wire.Reply // output that came before the size was known
 }
 
 // Result says how Run ended.
@@ -74,55 +77,90 @@ type Result struct {
 	Ended bool // the daemon ended it, rather than the user leaving
 }
 
-// Run joins a session over conn. If q asks for a separate stream of output, it
-// arrives on screen. Nothing reads from in once Run has returned.
-func Run(conn net.Conn, q wire.Request, screen <-chan io.Reader, in, out *os.File) (Result, error) {
-	u := &ui{conn: conn, out: out, actor: q.Type == wire.Actor, modes: map[int]bool{}, real: map[int]bool{}}
+// Joiner makes connections to a session.
+type Joiner interface {
+	// Join connects and sends q. If q asks for frames on a separate stream,
+	// that arrives on the channel.
+	Join(q wire.Request) (net.Conn, <-chan io.Reader, error)
+	// Retry reports whether a lost connection should be made again.
+	Retry() bool
+}
+
+const (
+	pingEvery = 3 * time.Second
+	quiet     = 7 * time.Second // without an answer before the user is told
+	giveUp    = 35 * time.Minute
+)
+
+type event struct {
+	gen int // which connection it is about
+	r   wire.Reply
+	err error
+}
+
+// Run joins a session. Nothing reads from in once it has returned.
+func Run(j Joiner, q wire.Request, in, out *os.File) (Result, error) {
+	u := &ui{out: out, actor: q.Type == wire.Actor, real: map[int]bool{}, retry: j.Retry()}
 	if err := u.size(out); err != nil {
 		return Result{}, err
 	}
-	u.newEmulator(80, 24)
 	q.Rows, q.Cols = u.termSize()
-	if err := wire.Write(conn, q); err != nil {
-		return Result{}, err
-	}
 	done := make(chan struct{})
 	defer close(done)
-	msgs := make(chan wire.Reply)
-	errs := make(chan error, 1)
-	receive := func(from io.Reader, failed func(error)) {
-		for {
-			var r wire.Reply
-			if err := wire.Read(from, wire.MaxReply, &r); err != nil {
-				failed(err)
-				return
-			}
-			select {
-			case msgs <- r:
-			case <-done:
-				return
+	events := make(chan event)
+	gen := 0
+	// use starts reading from a new connection.
+	use := func(conn net.Conn, screen <-chan io.Reader) {
+		gen++
+		g := gen
+		receive := func(from io.Reader, failed func(error)) {
+			for {
+				var r wire.Reply
+				if err := wire.Read(from, wire.MaxReply, &r); err != nil {
+					failed(err)
+					return
+				}
+				select {
+				case events <- event{gen: g, r: r}:
+				case <-done:
+					return
+				}
 			}
 		}
-	}
-	go receive(conn, func(err error) { errs <- err })
-	if q.Screen != 0 {
-		go func() {
+		u.conn, u.lost, u.heard, u.joining = conn, time.Time{}, time.Now(), true
+		go receive(conn, func(err error) {
 			select {
-			case s := <-screen:
-				receive(s, func(error) {}) // conn tells what happened
+			case events <- event{gen: g, err: err}:
 			case <-done:
 			}
-		}()
+		})
+		if screen != nil {
+			go func() {
+				select {
+				case s := <-screen:
+					receive(s, func(error) {}) // conn tells what happened
+				case <-done:
+				}
+			}()
+		}
 	}
+	conn, screen, err := j.Join(q)
+	if err != nil {
+		return Result{}, err
+	}
+	use(conn, screen)
+	defer func() {
+		if u.conn != nil {
+			_ = u.conn.Close()
+		}
+	}()
 	// The first answer says whether the request was accepted at all.
-	var first wire.Reply
-	select {
-	case first = <-msgs:
-	case err := <-errs:
-		return Result{}, fmt.Errorf("connection closed: %w", err)
+	first := <-events
+	if first.err != nil {
+		return Result{}, fmt.Errorf("connection closed: %w", first.err)
 	}
-	if first.Type == wire.Error {
-		return Result{}, errors.New(escapeLines(first.Text))
+	if first.r.Type == wire.Error {
+		return Result{}, errors.New(escapeLines(first.r.Text))
 	}
 	old, err := term.MakeRaw(int(in.Fd()))
 	if err != nil {
@@ -142,24 +180,79 @@ func Run(conn net.Conn, q wire.Request, screen <-chan io.Reader, in, out *os.Fil
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, unix.SIGWINCH)
 	defer signal.Stop(winch)
-	if why, over := u.receive(first); over {
+	if why, over := u.receive(first.r); over {
 		return Result{why, true}, nil
 	}
+	type joined struct {
+		conn   net.Conn
+		screen <-chan io.Reader
+		err    error
+	}
+	rejoined := make(chan joined)
 	tick := time.NewTicker(30 * time.Millisecond)
 	defer tick.Stop()
+	ping := time.NewTicker(pingEvery)
+	defer ping.Stop()
 	dirty := true
 	for {
 		select {
-		case r := <-msgs:
-			if why, over := u.receive(r); over {
+		case e := <-events:
+			if e.gen != gen {
+				break // from a connection that was given up
+			}
+			if e.err != nil {
+				_ = u.conn.Close()
+				u.conn = nil
+				if !u.retry || u.st.Session == "" {
+					if errors.Is(e.err, io.EOF) {
+						return Result{Why: "the connection was closed"}, nil
+					}
+					return Result{}, e.err
+				}
+				gen++ // nothing more from it
+				u.lost, dirty = time.Now(), true
+				again := wire.Request{Type: q.Type, Session: u.st.Session}
+				again.Rows, again.Cols = u.termSize()
+				go func(since time.Time) {
+					for {
+						c, s, err := j.Join(again)
+						if err != nil && !errors.Is(err, transport.ErrRefused) && time.Since(since) < giveUp {
+							select {
+							case <-time.After(time.Second):
+								continue
+							case <-done:
+								return
+							}
+						}
+						select {
+						case rejoined <- joined{c, s, err}:
+						case <-done:
+							if c != nil {
+								_ = c.Close()
+							}
+						}
+						return
+					}
+				}(u.lost)
+				break
+			}
+			u.heard = time.Now()
+			if u.joining && e.r.Type == wire.Error { // the session is gone
+				return Result{escapeLines(e.r.Text), true}, nil
+			}
+			if why, over := u.receive(e.r); over {
 				return Result{why, true}, nil
 			}
 			dirty = true
-		case err := <-errs:
-			if errors.Is(err, io.EOF) {
-				return Result{Why: "the connection was closed"}, nil
+		case n := <-rejoined:
+			if n.err != nil {
+				return Result{Why: "the session could not be resumed: " + n.err.Error()}, nil
 			}
-			return Result{}, err
+			use(n.conn, n.screen)
+			if r, c := u.termSize(); u.actor { // it may have changed meanwhile
+				u.request(wire.Request{Type: wire.Resize, Rows: r, Cols: c})
+			}
+			u.message, dirty = "", true
 		case k, ok := <-keys:
 			if !ok {
 				return Result{}, nil
@@ -179,13 +272,32 @@ func Run(conn net.Conn, q wire.Request, screen <-chan io.Reader, in, out *os.Fil
 				u.request(wire.Request{Type: wire.Resize, Rows: r, Cols: c})
 			}
 			dirty = true
+		case <-ping.C:
+			if u.retry && u.conn != nil {
+				u.request(wire.Request{Type: wire.Ping})
+			}
 		case <-tick.C:
-			if dirty {
+			if dirty || u.trouble() != "" {
 				u.draw()
 				dirty = false
 			}
 		}
 	}
+}
+
+// trouble describes what is wrong with the connection, if anything.
+func (u *ui) trouble() string {
+	clock := func(t time.Time) string {
+		s := int(time.Since(t).Seconds())
+		return fmt.Sprintf("%d:%02d", s/60, s%60)
+	}
+	switch {
+	case !u.lost.IsZero():
+		return "CONNECTION LOST, reconnecting " + clock(u.lost) + "   (Ctrl-] quits)"
+	case u.retry && time.Since(u.heard) > quiet:
+		return "NO ANSWER for " + clock(u.heard)
+	}
+	return ""
 }
 
 // readKeys delivers what is typed until stop is called, which waits until
@@ -252,71 +364,48 @@ func (u *ui) termSize() (rows, cols uint16) {
 
 func (u *ui) request(q wire.Request) {
 	q.Version = wire.Version
-	_ = u.conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	if u.conn == nil {
+		// Not kept for later: it was meant for what is on the screen now.
+		u.message = "not sent: there is no connection"
+		return
+	}
+	_ = u.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_ = wire.Write(u.conn, q) // a failure shows up when reading
 }
 
-func (u *ui) newEmulator(cols, rows int) {
-	if u.em != nil {
-		_ = u.em.Close()
-	}
-	u.em = vt.NewEmulator(cols, rows)
-	u.em.SetScrollbackSize(1)
-	u.modes = map[int]bool{}
-	u.em.SetCallbacks(vt.Callbacks{
-		Bell:        func() { u.bell = true },
-		EnableMode:  func(m ansi.Mode) { u.mode7(m, true) },
-		DisableMode: func(m ansi.Mode) { u.mode7(m, false) },
-	})
-	// Answers to queries are not sent on: they would be typed input.
-	go func(em *vt.Emulator) { _, _ = io.Copy(io.Discard, em) }(u.em)
-}
+// maxSide bounds the size of a screen.
+const maxSide = 1000
 
-// mode7 notes the harmless input modes that the actor's keyboard must follow.
-func (u *ui) mode7(m ansi.Mode, on bool) {
-	if d, ok := m.(ansi.DECMode); ok && (int(d) == 1 || int(d) == 2004) {
-		u.modes[int(d)] = on
+// newFrame applies a frame to the screen.
+func (u *ui) newFrame(f *wire.Frame) {
+	if f.Rows < 1 || f.Cols < 1 || f.Rows > maxSide || f.Cols > maxSide {
+		return
 	}
-}
-
-// feed gives output to the emulator, which handles hostile input.
-func (u *ui) feed(b []byte) {
-	defer func() {
-		if recover() != nil {
-			u.newEmulator(int(u.st.Cols), int(u.st.Rows))
-			u.message = "the screen could not be shown and was reset"
+	if f.Rows != u.frame.Rows || f.Cols != u.frame.Cols {
+		u.lines = make([][]wire.Run, f.Rows)
+	}
+	for _, l := range f.Lines {
+		if l.Y >= 0 && l.Y < f.Rows {
+			u.lines[l.Y] = l.Runs
 		}
-	}()
-	_, _ = u.em.Write(b)
+	}
+	u.bell = u.bell || u.frame.Rows > 0 && f.Bells > u.frame.Bells
+	u.frame = *f
+	u.frame.Lines = nil
 }
 
 func (u *ui) receive(r wire.Reply) (why string, over bool) {
 	switch r.Type {
-	case wire.Output:
-		if u.st.Cols == 0 {
-			if len(u.early) < 1024 {
-				u.early = append(u.early, r)
-			}
-			break
+	case wire.FrameType:
+		if r.Frame != nil {
+			u.newFrame(r.Frame)
 		}
-		if r.Reset {
-			u.newEmulator(max(1, u.em.Width()), max(1, u.em.Height()))
-		}
-		u.feed(r.Data)
 	case wire.StateType:
 		if r.State == nil {
 			break
 		}
 		u.st = *r.State
-		u.st.Cols, u.st.Rows = max(u.st.Cols, 1), max(u.st.Rows, 1)
-		if int(u.st.Cols) != u.em.Width() || int(u.st.Rows) != u.em.Height() {
-			u.em.Resize(int(u.st.Cols), int(u.st.Rows))
-		}
-		early := u.early
-		u.early = nil
-		for _, o := range early {
-			u.receive(o)
-		}
+		u.joining = false
 		if u.st.ID != u.shownID {
 			u.shownID, u.shownAt = u.st.ID, time.Now()
 			u.scroll, u.seenEnd, u.message = 0, false, ""
@@ -352,7 +441,7 @@ func (u *ui) key(b []byte) bool {
 	if u.actor {
 		for i, c := range b {
 			if c == detachKey {
-				if i > 0 {
+				if i > 0 && u.conn != nil {
 					u.request(wire.Request{Type: wire.Key, Data: b[:i]})
 				}
 				return true

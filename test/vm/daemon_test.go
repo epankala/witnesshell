@@ -43,7 +43,7 @@ func startDaemon(t *testing.T, config string) *bytes.Buffer {
 		if t.Failed() {
 			t.Logf("daemon log:\n%s", log.String())
 		}
-		if out, _ := exec.Command("pgrep", "-f", "__session|__terminal").Output(); len(out) != 0 {
+		if out, _ := exec.Command("pgrep", "-f", "__session|__terminal|__screen").Output(); len(out) != 0 {
 			t.Errorf("session processes left: %s", out)
 		}
 	})
@@ -445,6 +445,31 @@ func hear(t *testing.T, c net.Conn, typ string) wire.Reply {
 	}
 }
 
+// scr is a screen made of frames.
+type scr map[int]string
+
+func (s scr) add(r wire.Reply) {
+	if r.Frame == nil {
+		return
+	}
+	for _, l := range r.Frame.Lines {
+		s[l.Y] = ""
+		for _, run := range l.Runs {
+			s[l.Y] += run.T
+		}
+	}
+}
+
+func (s scr) text() string {
+	out := ""
+	for y := range 300 {
+		if s[y] != "" {
+			out += s[y] + "\n"
+		}
+	}
+	return out
+}
+
 // until waits for a state.
 func until(t *testing.T, c net.Conn, f func(*wire.State) bool) *wire.State {
 	t.Helper()
@@ -608,15 +633,15 @@ go(Type="sign",Text="00"*32)
 	got := make(chan struct{})
 	go func() {
 		defer close(got)
-		_ = a.SetReadDeadline(time.Now().Add(15 * time.Second))
+		_ = a.SetReadDeadline(time.Now().Add(60 * time.Second))
+		sc := scr{}
 		for strings.Count(out, "inside a session") < 4 {
 			var r wire.Reply
 			if wire.Read(a, wire.MaxReply, &r) != nil {
 				return
 			}
-			if r.Type == wire.Output {
-				out += string(r.Data)
-			}
+			sc.add(r)
+			out = sc.text()
 		}
 	}()
 	run("python3 /usr/local/lib/inside.py")

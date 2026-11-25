@@ -23,6 +23,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "witnesshell:", daemon.Terminal())
 		os.Exit(1)
 	}
+	if len(os.Args) > 1 && os.Args[1] == daemon.ScreenArg {
+		if daemon.Screen() != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == daemon.LeaderArg {
 		if err := daemon.Leader(); err != nil {
 			fmt.Fprintln(os.Stderr, "witnesshell:", err)

@@ -19,6 +19,7 @@ import (
 
 	"witnesshell/internal/daemon"
 	"witnesshell/internal/sign"
+	"witnesshell/internal/ui"
 	"witnesshell/internal/view"
 	"witnesshell/internal/wire"
 )
@@ -169,19 +170,22 @@ func attachOnce(d dialer, start bool, id string, lobby bool, stdout io.Writer) (
 		time.Sleep(time.Second)
 		_ = unix.IoctlSetInt(0, unix.TCFLSH, unix.TCIFLUSH)
 	}
-	c, err := d.open()
-	if err != nil {
-		return false, err
+	list := func() (wire.Reply, error) {
+		c, err := d.open()
+		if err != nil {
+			return wire.Reply{}, err
+		}
+		defer c.Close()
+		return ask(c, wire.Request{Type: wire.List})
 	}
-	defer c.Close()
-	q, err := choose(func() (wire.Reply, error) { return ask(c, wire.Request{Type: wire.List}) }, start, id, lobby, os.Stdin, stdout)
+	q, err := choose(list, start, id, lobby, os.Stdin, stdout)
 	if errors.Is(err, errQuit) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	res, err := joinSession(d, c, q)
+	res, err := ui.Run(joiner{d}, q, os.Stdin, os.Stdout)
 	if err != nil {
 		if lobby { // for example, the session has ended meanwhile
 			fmt.Fprintf(stdout, "witnesshell: %s\n", err)

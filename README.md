@@ -12,8 +12,8 @@ contractor access, four-eyes rules, and privileged work that must be reviewable
 afterwards.
 
 > [!WARNING]
-> **Under development.** Sessions work over SSH and QUIC. A lost connection is
-> not resumed by itself, and there is no audit log yet. This page describes the intended whole; parts not built yet
+> **Under development.** Sessions work over SSH and QUIC. There is no audit log
+> yet. This page describes the intended whole; parts not built yet
 > are marked *planned*. Do not rely on it for security.
 
 ## Contents
@@ -49,7 +49,8 @@ afterwards.
 
 1. The actor logs in over SSH, which hands over a one-time token and the host's
    certificate fingerprint. The session itself runs over QUIC (UDP), which copes
-   with packet loss.
+   with packet loss. A lost connection comes back by itself, also from a new
+   address, with exactly the current screen.
 2. Witnesses log in with their own accounts and join that session.
 3. The actor types a line. It is parsed, expanded and checked; **nothing has
    run yet**.
@@ -67,12 +68,14 @@ afterwards.
 - **No self-approval.** The actor's own account cannot vote.
 - **Votes are for one specific request**, so a late keypress cannot approve a
   newer command.
+- **Nothing is kept for later.** Keys and votes while the connection is lost are
+  refused, since they were meant for an older screen.
 - **No witness, no execution.** A command waits, one at a time. When the actor
   logs out, or has been disconnected for 30 minutes, it is dropped.
 - **Any user of the host may witness.** Witnesses watch the terminal live,
   including full-screen programs, but can never type into it.
-- **No spoofing.** Screens are drawn from a terminal emulator, so a program can
-  neither paint a fake approval panel nor send commands to a terminal.
+- **No spoofing.** Output goes through an unprivileged terminal emulator on the
+  host, and clients receive rows of text. So a program can neither paint a fake approval panel nor send commands to a terminal.
 - **No voting by programs.** Connections from inside a session are refused.
 - **Read before approving.** Long requests must be paged to the end.
 - **No hidden text.** Control, invisible and text-direction characters are
@@ -260,8 +263,8 @@ secrets included.
 | Daemon, approval screens, `view`, on-host `sign` | ✅ done |
 | Forced SSH login | ✅ done |
 | QUIC transport | ✅ done |
-| Reconnecting by itself | 🚧 next |
-| Audit logs and recording | planned |
+| Reconnecting by itself | ✅ done |
+| Audit logs and recording | 🚧 next |
 | Hardening, packaging, releases | planned |
 
 The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been

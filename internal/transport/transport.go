@@ -37,6 +37,15 @@ const (
 	streamsPerConn = 8
 )
 
+// Codes with which connections are closed.
+const (
+	codeQuit quic.ApplicationErrorCode = iota // the user has finished
+	codeDone
+)
+
+// ErrRefused means that trying again is pointless.
+var ErrRefused = errors.New("not accepted")
+
 func config() *quic.Config {
 	return &quic.Config{
 		HandshakeIdleTimeout: authTimeout,
@@ -137,9 +146,18 @@ func (s *Server) Close() {
 	_ = s.tr.Conn.Close()
 }
 
-// Serve accepts connections. auth turns a token into a user; handle serves
-// each stream of that user.
-func (s *Server) Serve(auth func(token string) (uint32, error), handle func(*Stream, uint32)) error {
+// Accepted says whose a connection is.
+type Accepted struct {
+	UID    uint32
+	Secret string          // lets the client resume; empty if it knows
+	Ended  func(quit bool) // called when the connection is over
+}
+
+// Auth decides about a connection by its first message. close ends it later.
+type Auth func(q wire.Request, close func()) (Accepted, error)
+
+// Serve accepts connections; handle serves each stream of their users.
+func (s *Server) Serve(auth Auth, handle func(*Stream, uint32)) error {
 	for {
 		c, err := s.ln.Accept(context.Background())
 		if err != nil {
@@ -152,8 +170,8 @@ func (s *Server) Serve(auth func(token string) (uint32, error), handle func(*Str
 	}
 }
 
-func (s *Server) serve(c *quic.Conn, auth func(string) (uint32, error), handle func(*Stream, uint32)) {
-	defer c.CloseWithError(0, "")
+func (s *Server) serve(c *quic.Conn, auth Auth, handle func(*Stream, uint32)) {
+	defer c.CloseWithError(codeDone, "")
 	ctx, cancel := context.WithTimeout(c.Context(), authTimeout)
 	defer cancel()
 	first, err := c.AcceptStream(ctx)
@@ -162,10 +180,10 @@ func (s *Server) serve(c *quic.Conn, auth func(string) (uint32, error), handle f
 	}
 	_ = first.SetDeadline(time.Now().Add(authTimeout))
 	var q wire.Request
-	if err := wire.Read(first, 4096, &q); err != nil || q.Type != wire.Auth {
+	if err := wire.Read(first, 4096, &q); err != nil || q.Type != wire.Auth && q.Type != wire.Resume {
 		return
 	}
-	uid, err := auth(q.Text)
+	a, err := auth(q, func() { _ = c.CloseWithError(codeDone, "") })
 	if err != nil {
 		_ = wire.Write(first, wire.Reply{Type: wire.Error, Text: err.Error()})
 		_ = first.Close()
@@ -176,10 +194,15 @@ func (s *Server) serve(c *quic.Conn, auth func(string) (uint32, error), handle f
 		}
 		return
 	}
+	defer func() {
+		// Only a client that says so has quit; others may come back.
+		var ae *quic.ApplicationError
+		a.Ended(errors.As(context.Cause(c.Context()), &ae) && ae.Remote && ae.ErrorCode == codeQuit)
+	}()
 	if known, ok := c.Context().Value(strangerKey{}).(func()); ok {
 		known()
 	}
-	if err := wire.Write(first, wire.Reply{Type: wire.OK}); err != nil {
+	if err := wire.Write(first, wire.Reply{Type: wire.OK, Text: a.Secret}); err != nil {
 		return
 	}
 	_ = first.Close()
@@ -188,7 +211,7 @@ func (s *Server) serve(c *quic.Conn, auth func(string) (uint32, error), handle f
 		if err != nil {
 			return
 		}
-		go handle(&Stream{st, c}, uid)
+		go handle(&Stream{st, c}, a.UID)
 	}
 }
 
@@ -208,8 +231,13 @@ func newCertificate() (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, err
 }
 
+var errImpostor = errors.New("the server's certificate is not the one that ssh vouched for")
+
 // Client is a connection to a server.
 type Client struct {
+	// Secret lets a later Dial resume the login.
+	Secret string
+
 	conn *quic.Conn
 
 	mu      sync.Mutex
@@ -217,13 +245,14 @@ type Client struct {
 	screens map[uint64]chan io.Reader
 }
 
-// Dial connects to addr, which must have the given certificate, and presents
-// the token.
-func Dial(ctx context.Context, addr, fingerprint, token string) (*Client, error) {
+// Dial connects to addr, which must have the given certificate, and sends auth,
+// an Auth or Resume request.
+func Dial(ctx context.Context, addr, fingerprint string, auth wire.Request) (*Client, error) {
 	want, err := hex.DecodeString(fingerprint)
 	if err != nil || len(want) != sha256.Size {
 		return nil, errors.New("bad fingerprint")
 	}
+	impostor := false
 	tc := &tls.Config{
 		NextProtos:             []string{alpn},
 		MinVersion:             tls.VersionTLS13,
@@ -236,7 +265,8 @@ func Dial(ctx context.Context, addr, fingerprint, token string) (*Client, error)
 			}
 			got := sha256.Sum256(st.PeerCertificates[0].Raw)
 			if subtle.ConstantTimeCompare(got[:], want) != 1 {
-				return errors.New("the server's certificate is not the one that ssh vouched for")
+				impostor = true
+				return errImpostor
 			}
 			return nil
 		},
@@ -245,34 +275,41 @@ func Dial(ctx context.Context, addr, fingerprint, token string) (*Client, error)
 	qc.KeepAlivePeriod = 3 * time.Second
 	qc.MaxIncomingStreams, qc.MaxIncomingUniStreams = -1, streamsPerConn
 	conn, err := quic.DialAddr(ctx, addr, tc, qc)
+	if impostor {
+		return nil, fmt.Errorf("%w: %w", ErrRefused, errImpostor)
+	}
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{conn: conn, screens: map[uint64]chan io.Reader{}}
-	if err := c.auth(token); err != nil {
-		c.Close()
+	if err := c.auth(auth); err != nil {
+		c.Drop()
 		return nil, err
 	}
 	go c.acceptScreens()
 	return c, nil
 }
 
-func (c *Client) auth(token string) error {
+func (c *Client) auth(q wire.Request) error {
+	q.Version = wire.Version
 	st, err := c.Open()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	_ = st.SetDeadline(time.Now().Add(authTimeout))
-	if err := wire.Write(st, wire.Request{Type: wire.Auth, Version: wire.Version, Text: token}); err != nil {
+	if err := wire.Write(st, q); err != nil {
 		return err
 	}
 	var r wire.Reply
 	if err := wire.Read(st, 4096, &r); err != nil {
-		return fmt.Errorf("not accepted: %w", err)
+		return err
 	}
 	if r.Type != wire.OK {
-		return fmt.Errorf("not accepted: %q", r.Text)
+		return fmt.Errorf("%w: %q", ErrRefused, r.Text)
+	}
+	if c.Secret = r.Text; q.Type == wire.Resume {
+		c.Secret = q.Text
 	}
 	return nil
 }
@@ -324,5 +361,11 @@ func (c *Client) acceptScreens() {
 	}
 }
 
-// Close ends the connection.
-func (c *Client) Close() { _ = c.conn.CloseWithError(0, "") }
+// Alive reports whether the connection is still thought to work.
+func (c *Client) Alive() bool { return c.conn.Context().Err() == nil }
+
+// Close ends the connection and the login.
+func (c *Client) Close() { _ = c.conn.CloseWithError(codeQuit, "") }
+
+// Drop ends the connection but not the login.
+func (c *Client) Drop() { _ = c.conn.CloseWithError(codeDone, "") }

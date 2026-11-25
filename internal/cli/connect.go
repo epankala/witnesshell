@@ -13,13 +13,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/term"
 
 	"witnesshell/internal/transport"
-	"witnesshell/internal/ui"
 	"witnesshell/internal/wire"
 )
 
@@ -29,19 +29,84 @@ const quicCommand = "quic 1"
 // dialer opens connections to a daemon.
 type dialer interface {
 	open() (net.Conn, error)
-	// screen asks for a separate stream of output; id 0 means there is none.
+	// screen asks for a separate stream of frames; id 0 means there is none.
 	screen() (id uint64, arrives <-chan io.Reader)
+	// lasting reports whether a lost connection can be made again.
+	lasting() bool
 }
 
 type localDialer struct{}
 
 func (localDialer) open() (net.Conn, error)            { return dial() }
 func (localDialer) screen() (uint64, <-chan io.Reader) { return 0, nil }
+func (localDialer) lasting() bool                      { return false }
 
-type quicDialer struct{ *transport.Client }
+// quicDialer makes its connection again when it is lost.
+type quicDialer struct {
+	addr, fingerprint string
 
-func (q quicDialer) open() (net.Conn, error)            { return q.Open() }
-func (q quicDialer) screen() (uint64, <-chan io.Reader) { return q.NewScreen() }
+	mu sync.Mutex
+	c  *transport.Client
+}
+
+func (q *quicDialer) client() (*transport.Client, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.c.Alive() {
+		return q.c, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := transport.Dial(ctx, q.addr, q.fingerprint, wire.Request{Type: wire.Resume, Text: q.c.Secret})
+	if err != nil {
+		return nil, err
+	}
+	q.c = c
+	return c, nil
+}
+
+func (q *quicDialer) open() (net.Conn, error) {
+	c, err := q.client()
+	if err != nil {
+		return nil, err
+	}
+	return c.Open()
+}
+
+func (q *quicDialer) screen() (uint64, <-chan io.Reader) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.c.NewScreen()
+}
+
+func (q *quicDialer) lasting() bool { return true }
+
+func (q *quicDialer) close() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.c.Close()
+}
+
+// joiner joins sessions for the user interface.
+type joiner struct{ d dialer }
+
+func (j joiner) Retry() bool { return j.d.lasting() }
+
+func (j joiner) Join(q wire.Request) (net.Conn, <-chan io.Reader, error) {
+	c, err := j.d.open()
+	if err != nil {
+		return nil, nil, err
+	}
+	q.Version = wire.Version
+	var arrives <-chan io.Reader
+	q.Screen, arrives = j.d.screen()
+	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := wire.Write(c, q); err != nil {
+		_ = c.Close()
+		return nil, nil, err
+	}
+	return c, arrives, nil
+}
 
 // ticket is what the bootstrap hands to the client over ssh.
 type ticket struct {
@@ -134,14 +199,14 @@ func runConnect(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, "connect", err)
 	}
-	defer c.Close()
-	if err := attachLoop(quicDialer{c}, false, "", stdout); err != nil {
+	defer c.close()
+	if err := attachLoop(c, false, "", stdout); err != nil {
 		return fail(stderr, "connect", err)
 	}
 	return ExitOK
 }
 
-func quicConnect(ssh string, o connectOptions, stderr io.Writer) (*transport.Client, error) {
+func quicConnect(ssh string, o connectOptions, stderr io.Writer) (*quicDialer, error) {
 	addrs, err := udpAddresses(ssh, o)
 	if err != nil {
 		return nil, err
@@ -158,12 +223,12 @@ func quicConnect(ssh string, o connectOptions, stderr io.Writer) (*transport.Cli
 		return nil, perr
 	}
 	for _, a := range addrs {
+		q := &quicDialer{addr: net.JoinHostPort(a, strconv.Itoa(t.port)), fingerprint: t.fingerprint}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		var c *transport.Client
-		c, err = transport.Dial(ctx, net.JoinHostPort(a, strconv.Itoa(t.port)), t.fingerprint, t.token)
+		q.c, err = transport.Dial(ctx, q.addr, q.fingerprint, wire.Request{Type: wire.Auth, Text: t.token})
 		cancel()
 		if err == nil {
-			return c, nil
+			return q, nil
 		}
 	}
 	return nil, fmt.Errorf("no UDP connection to %s port %d: %w\n(--udp-host=HOST sends UDP elsewhere; --ssh does without)", strings.Join(addrs, ", "), t.port, err)
@@ -201,12 +266,4 @@ func attachLoop(d dialer, start bool, id string, stdout io.Writer) error {
 		}
 		start, id = false, ""
 	}
-}
-
-// joinSession joins a session over c.
-func joinSession(d dialer, c net.Conn, q wire.Request) (ui.Result, error) {
-	q.Version = wire.Version
-	var arrives <-chan io.Reader
-	q.Screen, arrives = d.screen()
-	return ui.Run(c, q, arrives, os.Stdin, os.Stdout)
 }

@@ -174,16 +174,15 @@ import pty; m,s=pty.openpty(); print("new", os.ttyname(s))
 	say(a, wire.Request{Type: wire.Key, Data: []byte("python3 /usr/local/lib/spoof.py\r")})
 	p := until(t, b, phase(wire.Pending))
 	say(b, wire.Request{Type: wire.Vote, ID: p.ID, Approve: true})
-	out := ""
-	_ = a.SetReadDeadline(time.Now().Add(15 * time.Second))
+	out, sc := "", scr{}
+	_ = a.SetReadDeadline(time.Now().Add(60 * time.Second))
 	for !strings.Contains(out, "new /dev/pts/") {
 		var r wire.Reply
 		if err := wire.Read(a, wire.MaxReply, &r); err != nil {
 			t.Fatalf("%v: %q", err, out)
 		}
-		if r.Type == wire.Output {
-			out += string(r.Data)
-		}
+		sc.add(r)
+		out = sc.text()
 	}
 	if !strings.Contains(out, "tty /dev/pts/0 ['0', 'ptmx']") || !strings.Contains(out, "new /dev/pts/") {
 		t.Errorf("%q", out)

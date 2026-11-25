@@ -85,6 +85,7 @@ type Daemon struct {
 	starting int
 	conns    map[uint32]int
 	tokens   tokens
+	logins   logins
 	quic     *transport.Server // nil if disabled
 	last     time.Time
 }
@@ -99,6 +100,7 @@ func New(c Config, log *slog.Logger) (*Daemon, error) {
 	if err := d.store.Init(); err != nil {
 		return nil, err
 	}
+	d.logins.life = c.detach
 	d.c.ExecDirs = append(slices.Clone(c.ExecDirs), d.store.Dir+"/signed")
 	var fs unix.Statfs_t
 	if err := unix.Statfs(cgroupRoot, &fs); err != nil || fs.Type != unix.CGROUP2_SUPER_MAGIC {
@@ -162,18 +164,38 @@ func (d *Daemon) ServeQUIC() error {
 	d.quic = q
 	d.mu.Unlock()
 	go func() {
-		err := q.Serve(func(t string) (uint32, error) {
-			uid, err := d.tokens.redeem(t, time.Now())
-			if err != nil {
-				d.log.Warn("QUIC login refused", "err", err)
-			}
-			return uid, err
-		}, d.handleQUIC)
+		err := q.Serve(d.authQUIC, d.handleQUIC)
 		if err != nil {
 			d.log.Error("QUIC", "err", err)
 		}
 	}()
 	return nil
+}
+
+// authQUIC accepts a new login or the return to one.
+func (d *Daemon) authQUIC(q wire.Request, closeConn func()) (a transport.Accepted, err error) {
+	defer func() {
+		if err != nil {
+			d.log.Warn("QUIC login refused", "err", err)
+		}
+	}()
+	var g *login
+	var serial uint64
+	now := time.Now()
+	if q.Type == wire.Resume {
+		g, serial, err = d.logins.resume(q.Text, now, closeConn)
+	} else {
+		if a.UID, err = d.tokens.redeem(q.Text, now); err == nil {
+			a.Secret, g, serial, err = d.logins.start(a.UID, now, closeConn)
+		}
+	}
+	if err != nil {
+		return a, err
+	}
+	a.UID = g.uid
+	a.Ended = func(quit bool) { d.logins.ended(g, serial, quit, time.Now()) }
+	d.log.Info("QUIC login", "uid", a.UID, "resumed", q.Type == wire.Resume)
+	return a, nil
 }
 
 // Close ends all sessions.
@@ -237,6 +259,10 @@ func (d *Daemon) handle(conn *net.UnixConn) {
 	uid, err := peer(conn)
 	if err != nil {
 		d.log.Warn("connection refused", "err", err)
+		// Read first: closing with something unread would lose the answer.
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		var q wire.Request
+		_ = wire.Read(conn, 4096, &q)
 		_ = wire.Write(conn, wire.Reply{Type: wire.Error, Text: err.Error()})
 		return
 	}

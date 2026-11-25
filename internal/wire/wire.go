@@ -30,7 +30,7 @@ type Request struct {
 	ID      uint64 `json:",omitempty"`
 	Approve bool   `json:",omitempty"`
 	Text    string `json:",omitempty"` // comment, path or hash
-	// Screen asks for output on a separate stream with this name, if not 0.
+	// Screen asks for frames on a separate stream with this name, if not 0.
 	Screen uint64 `json:",omitempty"`
 }
 
@@ -45,19 +45,20 @@ const (
 	Vote     = "vote"   // witness
 	View     = "view"   // witness: Text is a path
 	Checksig = "checksig"
-	Token    = "token" // local only: a login for QUIC
-	Auth     = "auth"  // QUIC only, first of all: Text is the token
+	Token    = "token"  // local only: a login for QUIC
+	Auth     = "auth"   // QUIC only, first of all: Text is the token
+	Resume   = "resume" // instead of Auth: Text is the secret of the login
+	Ping     = "ping"
 )
 
 // Reply is a message from the daemon.
 type Reply struct {
 	Type     string
 	Text     string    `json:",omitempty"`
-	Data     []byte    `json:",omitempty"`
 	Sessions []Session `json:",omitempty"`
 	State    *State    `json:",omitempty"`
 	Doc      *view.Doc `json:",omitempty"`
-	Reset    bool      `json:",omitempty"` // Output: start with an empty screen
+	Frame    *Frame    `json:",omitempty"`
 	CanStart bool      `json:",omitempty"` // Sessions
 }
 
@@ -66,12 +67,13 @@ const (
 	Sessions  = "sessions"
 	OK        = "ok"
 	Error     = "error" // the request failed
-	Output    = "output"
+	FrameType = "frame"
+	Pong      = "pong"
 	StateType = "state"
 	Doc       = "doc"
 	Report    = "report" // of checksig
 	End       = "end"    // the session is over
-	Screen    = "screen" // begins a stream of output; Text is its name
+	Screen    = "screen" // begins a stream of frames; Text is its name
 )
 
 // Session is an entry in the list of sessions.
@@ -116,6 +118,30 @@ type State struct {
 	ActorOnline         bool
 	Notice              string
 	Weak                []string // host problems that were overridden
+}
+
+// Frame is what changed on the screen. The first one a client gets is complete.
+type Frame struct {
+	Rows, Cols int
+	Lines      []Line `json:",omitempty"`
+	CX, CY     int
+	Hidden     bool   `json:",omitempty"` // the cursor
+	AppKeys    bool   `json:",omitempty"`
+	Paste      bool   `json:",omitempty"`
+	Bells      uint64 `json:",omitempty"` // so far
+}
+
+// Line is the new content of a row.
+type Line struct {
+	Y    int
+	Runs []Run `json:",omitempty"`
+}
+
+// Run is text of one style, W columns wide. S is an SGR sequence.
+type Run struct {
+	T string
+	S string `json:",omitempty"`
+	W int
 }
 
 var errSize = errors.New("message too large")

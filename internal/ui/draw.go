@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -128,7 +129,7 @@ func (u *ui) draw() {
 	if u.actor {
 		m := map[int]bool{2004: true} // the daemon understands pasting
 		if u.st.Phase == wire.Running {
-			m = u.modes
+			m = map[int]bool{1: u.frame.AppKeys, 2004: u.frame.Paste}
 		}
 		u.setModes(m)
 	}
@@ -148,49 +149,44 @@ func (u *ui) setModes(want map[int]bool) {
 	}
 }
 
+// sgr is what a style may be: colors and attributes only.
+var sgr = regexp.MustCompile(`^(\x1b\[[0-9;:]*m)*$`)
+
 // drawScreen renders n rows of the session's screen, around the cursor if it
 // is larger than the window.
 func (u *ui) drawScreen(n int) (lines []string, cx, cy int, visible bool) {
-	pos := u.em.CursorPosition()
 	top := 0
-	if pos.Y >= n {
-		top = pos.Y - n + 1
+	if u.frame.CY >= n {
+		top = u.frame.CY - n + 1
 	}
 	for y := top; y < top+n; y++ {
+		var runs []wire.Run
+		if y < len(u.lines) {
+			runs = u.lines[y]
+		}
 		var b strings.Builder
-		style, width := "", 0
-		for x := 0; x < u.em.Width() && x < u.cols; x++ {
-			content, st, w := " ", "", 1
-			if c := u.em.CellAt(x, y); c != nil {
-				if c.Width == 0 && c.Content == "" && x > 0 {
-					if prev := u.em.CellAt(x-1, y); prev != nil && prev.Width > 1 {
-						continue // second half of a wide character
-					}
-				}
-				if c.Content != "" {
-					content = view.Escape(c.Content)
-					w = max(1, c.Width)
-					// Whatever Escape had to change does not belong here.
-					if ansi.StringWidth(content) != w {
-						content, w = "?", 1
-					}
-				}
-				st = c.Style.String()
+		width := 0
+		for _, r := range runs {
+			text := view.Escape(r.T)
+			if ansi.StringWidth(text) != r.W {
+				// What had to be changed does not belong here.
+				text = strings.Repeat("?", max(0, min(r.W, u.cols)))
 			}
-			if width+w > u.cols {
-				break
+			if room := u.cols - width; ansi.StringWidth(text) > room {
+				text = ansi.Truncate(text, room, "")
 			}
-			if st != style {
-				b.WriteString(reset + st)
-				style = st
+			width += ansi.StringWidth(text)
+			b.WriteString(reset)
+			if sgr.MatchString(r.S) {
+				b.WriteString(r.S)
 			}
-			b.WriteString(content)
-			width += w
+			b.WriteString(text)
 		}
 		b.WriteString(reset + strings.Repeat(" ", max(0, u.cols-width)))
 		lines = append(lines, b.String())
 	}
-	return lines, min(pos.X, u.cols-1), pos.Y - top, !u.em.CursorHidden() && pos.Y-top < n
+	cy = u.frame.CY - top
+	return lines, max(0, min(u.frame.CX, u.cols-1)), cy, !u.frame.Hidden && cy >= 0 && cy < n
 }
 
 func (u *ui) title() string {
@@ -227,7 +223,11 @@ func (u *ui) title() string {
 func (u *ui) drawPanel() (lines []string, cx, cursorRow int) {
 	cursorRow = -1
 	add := func(style, s string) { lines = append(lines, style+fit(s, u.cols)+reset) }
-	add(reverse, u.title())
+	if t := u.trouble(); t != "" {
+		add(red+reverse, " "+t)
+	} else {
+		add(reverse, u.title())
+	}
 	if u.actor {
 		switch u.st.Phase {
 		case wire.Running:
@@ -239,7 +239,11 @@ func (u *ui) drawPanel() (lines []string, cx, cursorRow int) {
 			cx, cursorRow = x, len(lines)
 			add("", line)
 		}
-		add("", view.Escape(u.st.Notice))
+		notice := u.st.Notice
+		if u.message != "" {
+			notice = u.message
+		}
+		add("", view.Escape(notice))
 		return lines, cx, cursorRow
 	}
 	d := u.details()
@@ -316,6 +320,9 @@ func (u *ui) drawPager() []string {
 	}
 	if u.st.Phase == wire.Pending {
 		foot += "   REQUEST WAITING"
+	}
+	if t := u.trouble(); t != "" {
+		foot = " " + t
 	}
 	return append(lines, reverse+fit(foot, u.cols)+reset)
 }
