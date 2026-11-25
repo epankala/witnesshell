@@ -12,10 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"witnesshell/internal/audit"
 	"witnesshell/internal/gate"
 	"witnesshell/internal/launch"
 	"witnesshell/internal/pty"
 	"witnesshell/internal/sign"
+	"witnesshell/internal/version"
 	"witnesshell/internal/view"
 	"witnesshell/internal/wire"
 )
@@ -184,12 +186,15 @@ type session struct {
 	leader *leader
 	cgroup string
 	proc   *screenProc
+	audit  *audit.Session
+	pumped chan struct{} // closed when there is no more output
 
 	mu         sync.Mutex
 	gate       *gate.Gate
 	keys       keys
 	checking   bool
 	serial     uint64 // of the prepared command
+	request    string // hash of the log entry of the pending request
 	details    []string
 	warnings   []string
 	dir        string
@@ -210,12 +215,20 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 	if err != nil {
 		return nil, err
 	}
-	s := &session{d: d, actor: u, weak: weak, gate: g, since: d.nextStart()}
+	s := &session{d: d, actor: u, weak: weak, gate: g, since: d.nextStart(), pumped: make(chan struct{})}
 	s.id = s.since.Format("20060102T150405.000Z")
 	s.log = d.log.With("session", s.id, "actor", u.Name)
 	s.rows, s.cols = clampSize(rows, cols)
+	host, _ := os.Hostname()
+	s.audit, err = audit.Open(d.c.RecordDir, s.id, u.Name, u.UID, audit.Data{"session": s.id, "host": host, "actor": u.Name, "actor_uid": u.UID,
+		"approvals_required": d.c.ApprovalsRequired, "host_problems": weak, "version": version.Version}, s.rows, s.cols, s.since)
+	if err != nil {
+		d.log.Error("cannot log sessions", "err", err)
+		return nil, errors.New("the session cannot be logged, so it cannot start")
+	}
 	fail := func(err error) (*session, error) {
 		s.removeCgroup()
+		_, _ = s.audit.Close("could not be started")
 		return nil, err
 	}
 	s.cgroup = cgroupBase + "/" + s.id
@@ -273,16 +286,60 @@ func (s *session) removeCgroup() {
 
 // pump feeds terminal output to the screen.
 func (s *session) pump() {
+	defer close(s.pumped)
 	b := make([]byte, 32<<10)
 	for {
 		n, err := s.ptm.Read(b)
 		if n > 0 {
+			s.logged(s.audit.Output(b[:n]))
 			s.proc.output(b[:n])
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// logged ends the session if something could not be logged: nothing may go on
+// without. It reports whether all is well.
+func (s *session) logged(err error) bool {
+	if err != nil && !errors.Is(err, audit.ErrClosed) {
+		s.log.Error("cannot log", "err", err)
+		go s.end("the session can no longer be logged")
+	}
+	return err == nil
+}
+
+// note adds an event to the actor's log, and to those of witnesses who are
+// there if asked to. It is on disk afterwards. Lock held.
+func (s *session) note(event string, d audit.Data, witnesses bool) (string, bool) {
+	h, err := s.audit.Actor(event, d, true)
+	if !s.logged(err) || !witnesses {
+		return h, err == nil
+	}
+	if event == audit.Request {
+		d["request_hash"] = h
+	}
+	seen := map[uint32]bool{}
+	for _, c := range s.clients {
+		if c.actor || seen[c.user.UID] {
+			continue
+		}
+		seen[c.user.UID] = true
+		if !s.logged(s.audit.Witness(c.user.UID, c.user.Name, event, d, true)) {
+			return "", false
+		}
+	}
+	return h, true
+}
+
+// own adds an event to the log of the user it is about. Lock held.
+func (s *session) own(c *client, event string, d audit.Data) bool {
+	if c.actor {
+		_, err := s.audit.Actor(event, d, false)
+		return s.logged(err)
+	}
+	return s.logged(s.audit.Witness(c.user.UID, c.user.Name, event, d, true))
 }
 
 // newFrame takes a frame from the screen process.
@@ -321,6 +378,7 @@ func (s *session) end(why string) {
 	s.mu.Lock()
 	if r, purged := s.gate.Logout(); purged {
 		s.log.Info("request purged", "id", r.ID)
+		s.note(audit.Purged, audit.Data{"id": r.ID, "request_hash": s.request, "why": why}, true)
 	}
 	if s.detach != nil {
 		s.detach.Stop()
@@ -341,6 +399,17 @@ func (s *session) end(why string) {
 	}
 	// Nothing may outlive the session: it would be unwitnessed.
 	s.removeCgroup()
+	select {
+	case <-s.pumped:
+	case <-time.After(2 * time.Second):
+	}
+	// The seal also goes to the system's log, where changing it is harder.
+	seal, err := s.audit.Close(why)
+	if err != nil {
+		s.log.Error("logs are incomplete", "err", err)
+		return
+	}
+	s.log.Info("session sealed", "sha256", seal)
 }
 
 var errOver = errors.New("the session is over")
@@ -351,6 +420,10 @@ func (s *session) join(c *client, rows, cols uint16) error {
 	defer s.mu.Unlock()
 	if s.over {
 		return errOver
+	}
+	d := audit.Data{"user": c.user.Name, "uid": c.user.UID, "as_actor": c.actor}
+	if _, ok := s.note(audit.Join, d, false); !ok || !c.actor && !s.own(c, audit.Join, d) {
+		return errors.New("the session can no longer be logged")
 	}
 	if c.actor {
 		for _, o := range slices.Clone(s.clients) {
@@ -401,6 +474,11 @@ func (s *session) leave(c *client) {
 		return
 	}
 	s.log.Info("left", "user", c.user.Name, "as_actor", c.actor)
+	d := audit.Data{"user": c.user.Name, "uid": c.user.UID, "as_actor": c.actor}
+	s.note(audit.Leave, d, false)
+	if !c.actor {
+		s.own(c, audit.Leave, d)
+	}
 	if c.actor {
 		s.detach = time.AfterFunc(s.d.c.detach, func() { s.end("the actor was away too long") })
 	}
@@ -409,7 +487,12 @@ func (s *session) leave(c *client) {
 
 // resize sets the terminal size. Lock held.
 func (s *session) resize(rows, cols uint16) {
-	s.rows, s.cols = clampSize(rows, cols)
+	r, c := clampSize(rows, cols)
+	if r == s.rows && c == s.cols {
+		return
+	}
+	s.rows, s.cols = r, c
+	s.logged(s.audit.Resize(r, c))
 	_ = pty.Resize(s.ptm, s.rows, s.cols)
 	go s.proc.resize()
 }
@@ -485,6 +568,8 @@ func (s *session) keyLocked(data []byte) (logout bool) {
 				var r gate.Request
 				if r, err = s.gate.Cancel(); err == nil {
 					s.log.Info("request cancelled", "id", r.ID)
+					s.note(audit.Cancelled, audit.Data{"id": r.ID, "request_hash": s.request}, true)
+					s.logged(s.audit.Marker("cancelled"))
 					s.notice = "cancelled"
 				}
 			} else {
@@ -528,6 +613,7 @@ func (s *session) prepare(text string) {
 	}
 	if err != nil {
 		s.notice = view.Escape(err.Error())
+		s.note(audit.Refused, audit.Data{"text": text, "why": err.Error()}, false)
 		s.broadcast()
 		return
 	}
@@ -535,12 +621,16 @@ func (s *session) prepare(text string) {
 	if r.Free {
 		if _, err = s.gate.SubmitFree(); err == nil {
 			s.log.Info("free command", "text", text)
-			go s.run(r.Serial)
+			if _, ok := s.note(audit.Free, audit.Data{"text": text}, false); ok {
+				go s.run(r.Serial, audit.Data{"text": text})
+			}
 		}
 	} else {
 		var req gate.Request
 		if req, err = s.gate.Submit(); err == nil {
 			s.log.Info("request", "id", req.ID, "text", text, "details", r.Details, "warnings", r.Warnings)
+			s.request, _ = s.note(audit.Request, audit.Data{"id": req.ID, "text": text, "details": r.Details, "warnings": r.Warnings, "directory": s.dir}, true)
+			s.logged(s.audit.Marker("request: " + text))
 		}
 	}
 	if err != nil {
@@ -549,8 +639,9 @@ func (s *session) prepare(text string) {
 	s.broadcast()
 }
 
-// run executes the prepared command and returns to the prompt.
-func (s *session) run(serial uint64) {
+// run executes the prepared command, which was logged, and returns to the
+// prompt. about goes into the entry for its end.
+func (s *session) run(serial uint64, about audit.Data) {
 	r, err := s.leader.call(leaderReq{Run: serial})
 	s.mu.Lock()
 	if s.over {
@@ -571,6 +662,12 @@ func (s *session) run(serial uint64) {
 		s.notice = ""
 	}
 	s.log.Info("command ended", "status", r.Status, "err", r.Err)
+	about["status"], about["error"], about["directory"] = r.Status, r.Err, r.Dir
+	if r.SHA256 != "" {
+		about["sha256"] = r.SHA256
+	}
+	s.note(audit.RunEnd, about, false)
+	s.logged(s.audit.Marker(fmt.Sprintf("ended, status %d", r.Status)))
 	s.broadcast()
 	s.mu.Unlock()
 	if err != nil || r.Exited {
@@ -596,11 +693,33 @@ func (s *session) vote(c *client, q wire.Request) error {
 		return err
 	}
 	s.log.Info("vote", "id", q.ID, "by", c.user.Name, "approve", q.Approve, "comment", q.Text, "outcome", r.Outcome.String())
+	d := audit.Data{"id": q.ID, "request_hash": s.request, "by": c.user.Name, "uid": c.user.UID, "approve": q.Approve, "outcome": r.Outcome.String()}
+	if !q.Approve {
+		d["comment"] = strings.TrimSpace(q.Text)
+	}
+	_, ok := s.note(audit.Vote, d, false)
+	if ok = ok && s.own(c, audit.Vote, d); !ok {
+		if r.Outcome == gate.Approved {
+			_ = s.gate.Finished() // it must not run
+		}
+		return errors.New("the session can no longer be logged")
+	}
 	switch r.Outcome {
 	case gate.Approved:
 		s.notice = ""
-		go s.run(s.serial)
+		run := audit.Data{"id": q.ID, "request_hash": s.request}
+		_, ok := s.note(audit.RunStart, run, true)
+		var by []string
+		for _, v := range r.Votes {
+			by = append(by, s.d.userName(v.UID))
+		}
+		if !ok || !s.logged(s.audit.Marker("approved by "+strings.Join(by, ", "))) {
+			_ = s.gate.Finished()
+			return errors.New("the session can no longer be logged")
+		}
+		go s.run(s.serial, run)
 	case gate.Rejected:
+		s.logged(s.audit.Marker(fmt.Sprintf("rejected by %s: %s", c.user.Name, strings.TrimSpace(q.Text))))
 		s.notice = fmt.Sprintf("rejected by %s: %s", c.user.Name, strings.ReplaceAll(strings.TrimSpace(q.Text), "\n", " "))
 	}
 	s.broadcast()
@@ -618,16 +737,31 @@ func (s *session) inspect(c *client, q wire.Request, store *sign.Store) wire.Rep
 	dir := s.currentDir()
 	var r wire.Reply
 	var err error
+	d := audit.Data{"what": q.Type, "path": q.Text, "directory": dir}
 	if q.Type == wire.View {
 		r.Type = wire.Doc
-		r.Doc, err = view.Load(c.user, dir, q.Text)
+		if r.Doc, err = view.Load(c.user, dir, q.Text); err == nil {
+			d["sha256"] = r.Doc.SHA256
+		}
 	} else {
 		var b strings.Builder
 		r.Type = wire.Report
-		err = view.Checksig(&b, c.user, dir, q.Text, store, s.actor)
+		var h string
+		if h, err = view.Checksig(&b, c.user, dir, q.Text, store, s.actor); err == nil {
+			d["sha256"] = h
+		}
 		r.Text = b.String()
 	}
 	s.log.Info(q.Type, "by", c.user.Name, "path", q.Text, "err", err)
+	if err != nil {
+		d["error"] = err.Error()
+	}
+	s.mu.Lock()
+	ok := s.own(c, audit.Inspect, d)
+	s.mu.Unlock()
+	if !ok {
+		return wire.Reply{Type: wire.Error, Text: "this cannot be logged"}
+	}
 	if err != nil {
 		return wire.Reply{Type: wire.Error, Text: view.Escape(err.Error())}
 	}
@@ -676,6 +810,12 @@ func (s *session) serve(c *client) {
 			r := wire.Reply{Type: wire.OK, Text: "signed"}
 			if err := s.d.sign(c.user, q.Text); err != nil {
 				r = wire.Reply{Type: wire.Error, Text: err.Error()}
+			} else {
+				s.mu.Lock()
+				d := audit.Data{"by": c.user.Name, "uid": c.user.UID, "sha256": q.Text}
+				s.note(audit.Signed, d, false)
+				s.own(c, audit.Signed, d)
+				s.mu.Unlock()
 			}
 			s.reply(c, r)
 		default:

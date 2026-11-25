@@ -1,7 +1,7 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 to M5 done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M6.
+> Status: M0 to M6 done. v0.4 (2026-11-23) makes witnesshell itself the
+> shell; the earlier bash code is gone. Next: M7.
 
 ## 0. Decisions
 
@@ -417,7 +417,7 @@ approvals_required = 1        # K
 max_sessions       = 0        # 0 = unlimited, 1 = single session on host
 detach_timeout     = "30m"    # actor gone this long → logout, queue purged, SIGHUP
 udp_port           = 60001    # 0 disables QUIC
-record_dir         = "/var/log/witnesshell"   # M6
+record_dir         = "/var/log/witnesshell"
 exec_dirs          = ["/usr"]  # where Landlock allows programs
 allow_weak_host    = false    # skip the host checks of §4.5
 allow_upload       = true     # client to host, with approval (M7)
@@ -516,10 +516,25 @@ gives two sessions the same start time. Files are owned by root, mode 0600.
 | Transfers (§4.8): direction, host path, size, SHA-256, outcome | yes | yes, while joined |
 | Command start, end, exit status; queue purge | yes | no |
 
-Each entry carries the SHA-256 of the previous one, forming a chain per file.
-Votes carry the request ID and hash in both logs, and the final hash of every
-witness log goes into the actor log, so a removed or altered file is noticed.
-`witsh audit verify <session start>` checks a session's files together.
+Further events: submitted lines that were refused before witnesses saw them, and
+signatures made in the session.
+
+- **Chain.** Each entry holds the SHA-256 of the line before. Votes, and requests
+  in witness logs, hold the hash of the request's entry in the actor log.
+- **Seal.** The last entry of the actor log holds the final hash of every witness
+  log and of the recording. Its own hash seals the session and also goes to the
+  system's log, because root could rewrite all files of a session consistently.
+  Sending the system's log to another machine makes that evident.
+- **Nothing runs unlogged.** Requests, votes and starts are on disk (fdatasync)
+  before a command runs. If anything cannot be logged or recorded, the session
+  ends, and no new one starts. A full disk therefore stops all work: keep
+  `record_dir` on a filesystem that actors cannot fill, and an admin account
+  outside witnesshell. Deleting old files is the administrator's business.
+- `witsh audit verify [-seal SHA256] SESSION-START` checks a session's files
+  together, as root. A session that runs or ended abnormally is reported as
+  incomplete; what was written of it can still be checked.
+- An existing `record_dir` must be owned by root and writable by nobody else; its
+  permissions are not changed.
 
 ### 8.1 Recording: asciicast v2 (D9)
 
@@ -533,8 +548,8 @@ Contents:
 - header: session id, actor, host, terminal size, start time
 - `o` events: all terminal output, whatever the state
 - `r` events: resizes
-- `m` markers: `⏳ alice: systemctl restart nginx`,
-  `✔ bob,carol`, `✘ bob: "…"`, `▶ running`, `■ exited`. The web player
+- `m` markers: `request: systemctl restart nginx`, `approved by bob, carol`,
+  `rejected by bob: ...`, `cancelled`, `ended, status 0`. The web player
   shows markers as chapters you can jump between.
 - **no `i` (input) events**, so passwords typed in RUNNING state never end
   up in the file.

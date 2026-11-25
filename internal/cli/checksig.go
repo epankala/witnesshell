@@ -43,7 +43,7 @@ func runChecksig(args []string, stdout, stderr io.Writer) int {
 		wd, err = os.Getwd()
 	}
 	if err == nil {
-		err = view.Checksig(stdout, u, wd, args[0], systemStore(), u)
+		_, err = view.Checksig(stdout, u, wd, args[0], systemStore(), u)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "witsh checksig: %v\n", err)

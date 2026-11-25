@@ -46,6 +46,7 @@ type leaderResp struct {
 	Status   int
 	Dir      string
 	Exited   bool
+	SHA256   string // of the file that was looked at
 }
 
 // Leader is the body of the leader process.
@@ -93,6 +94,7 @@ func Leader() error {
 			err = errors.New("internal error: wrong command")
 			if last != nil && q.Run == serial {
 				r.Status, err = s.Run(last)
+				r.SHA256 = s.Inspected()
 				last = nil
 			}
 		}

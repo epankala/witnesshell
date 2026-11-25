@@ -18,6 +18,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"golang.org/x/sys/unix"
 
+	"witnesshell/internal/audit"
 	"witnesshell/internal/hostcheck"
 	"witnesshell/internal/launch"
 	"witnesshell/internal/sign"
@@ -44,12 +45,13 @@ type Config struct {
 	AllowWeakHost     bool     `toml:"allow_weak_host"`
 	UDPPort           int      `toml:"udp_port"` // 0 disables QUIC
 	ExecDirs          []string `toml:"exec_dirs"`
+	RecordDir         string   `toml:"record_dir"`
 	detach            time.Duration
 }
 
 // LoadConfig reads a configuration file. A missing file means defaults.
 func LoadConfig(name string) (Config, error) {
-	c := Config{ApprovalsRequired: 1, UDPPort: 60001, DetachTimeout: "30m", ExecDirs: []string{"/usr"}}
+	c := Config{ApprovalsRequired: 1, UDPPort: 60001, DetachTimeout: "30m", ExecDirs: []string{"/usr"}, RecordDir: audit.DefaultDir}
 	md, err := toml.DecodeFile(name, &c)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return c, err
@@ -65,6 +67,9 @@ func LoadConfig(name string) (Config, error) {
 	}
 	if c.UDPPort < 0 || c.UDPPort > 65535 {
 		return c, fmt.Errorf("%s: bad udp_port", name)
+	}
+	if !filepath.IsAbs(c.RecordDir) {
+		return c, fmt.Errorf("%s: record_dir must be an absolute path", name)
 	}
 	for _, d := range c.ExecDirs {
 		if !filepath.IsAbs(d) {

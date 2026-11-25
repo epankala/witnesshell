@@ -124,23 +124,23 @@ func Escape(s string) string {
 	return b.String()
 }
 
-// Checksig reports on a file with u's permissions. actor is the user whose
+// Checksig reports on a file with u's permissions and returns its hash. actor is the user whose
 // own signature would not count.
-func Checksig(w io.Writer, u launch.User, dir, name string, store *sign.Store, actor launch.User) error {
+func Checksig(w io.Writer, u launch.User, dir, name string, store *sign.Store, actor launch.User) (sha256 string, err error) {
 	f, err := open(u, dir, name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	dg, err := sign.Hash(f)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var armored []byte
 	if sf, err := open(u, dir, name+".sig"); err == nil {
 		defer sf.Close()
 		if armored, err = sign.ReadSignature(sf); err != nil {
-			return err
+			return "", err
 		}
 	}
 	a := trust.Actor{UID: actor.UID, GIDs: append([]uint32{actor.GID}, actor.Groups...)}
@@ -149,7 +149,7 @@ func Checksig(w io.Writer, u launch.User, dir, name string, store *sign.Store, a
 		t, err = trust.Resolve(abs(dir, name), a)
 		return err
 	}); err != nil {
-		return err
+		return "", err
 	}
 	defer t.Close()
 	fmt.Fprintf(w, "file     %s\nsha256   %s\nowner    uid %d, mode %04o\n", Escape(t.Path), dg.Hex(), t.Stat.Uid, t.Stat.Mode&0o7777)
@@ -172,7 +172,7 @@ func Checksig(w io.Writer, u launch.User, dir, name string, store *sign.Store, a
 	if sigErr != nil {
 		fmt.Fprintf(w, "problem  %s\n", Escape(sigErr.Error()))
 	}
-	return nil
+	return dg.Hex(), nil
 }
 
 // Pager is the state of a simple pager.

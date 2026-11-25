@@ -50,6 +50,8 @@ type Shell struct {
 	gen      uint64 // changes with every Run; see ErrStale
 	exited   bool
 	termios  *unix.Termios
+	// inspected is the hash of the file that the last command looked at.
+	inspected string
 
 	mu      sync.Mutex
 	changed *sync.Cond // some job's state changed
@@ -113,6 +115,9 @@ func New(c Config) (*Shell, error) {
 
 // Dir returns the current directory.
 func (s *Shell) Dir() string { return s.dir }
+
+// Inspected returns the hash of the file that the last command looked at.
+func (s *Shell) Inspected() string { return s.inspected }
 
 // Exited reports whether the actor has left the shell.
 func (s *Shell) Exited() bool { return s.exited }
@@ -419,6 +424,7 @@ func (s *Shell) Run(p *Prepared) (int, error) {
 	if p.gen != s.gen {
 		return 0, ErrStale
 	}
+	s.inspected = ""
 	s.gen++
 	// Leftover typing must not feed this command. No keys are passed to the
 	// terminal while no command runs, so nothing can arrive behind the flush.
@@ -740,6 +746,7 @@ func (s *Shell) view(args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	s.inspected = d.SHA256
 	fd := int(s.c.TTY.Fd())
 	ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
 	if err != nil {
@@ -761,9 +768,11 @@ func (s *Shell) checksig(args []string) (int, error) {
 	if len(args) != 1 {
 		return 1, errors.New("want one file")
 	}
-	if err := view.Checksig(s.out(), s.c.User, s.dir, args[0], s.c.Policy.Store, s.c.User); err != nil {
+	h, err := view.Checksig(s.out(), s.c.User, s.dir, args[0], s.c.Policy.Store, s.c.User)
+	if err != nil {
 		return 1, err
 	}
+	s.inspected = h
 	return 0, nil
 }
 

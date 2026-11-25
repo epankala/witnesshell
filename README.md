@@ -22,9 +22,8 @@ The command is `witsh`; group, service and paths on the host are named
 `witnesshell`.
 
 > [!WARNING]
-> **Under development.** Sessions work over SSH and QUIC. There is no audit log
-> yet. This page describes the intended whole; parts not built yet
-> are marked *planned*. Do not rely on it for security.
+> **Under development.** The core works, but nobody else has reviewed it. Parts
+> not built yet are marked *planned*. Do not rely on it for security.
 
 ## Contents
 
@@ -249,7 +248,8 @@ change does not go unnoticed.
 
 ## Logging and recording
 
-*Planned.* Actor and witnesses get separate logs with the same session start:
+Actor and witnesses get separate logs with the same session start, in
+`/var/log/witnesshell`, readable by root only:
 
 ```
 witnesshell-<session start>-actor-<name>.log
@@ -257,10 +257,17 @@ witnesshell-<session start>-actor-<name>.cast
 witnesshell-<session start>-witness-<name>.log
 ```
 
-Each log is a chain of hashes, so changes are noticed. The `.cast` file is a
-terminal recording in asciicast v2 format for `asciinema play`, with a marker
-for each request. Typed keys are not recorded, but anything shown on screen is,
-secrets included.
+- **Nothing runs unlogged.** Entries are on disk before a command starts. If
+  something cannot be logged, the session ends. A full disk stops all work, so
+  give the logs a filesystem that actors cannot fill.
+- **Changes are noticed.** Each log is a chain of hashes, and the end of the actor
+  log seals the witness logs and the recording:
+  `witsh audit verify <session start>`.
+- **The seal is also in the system's log**, since root could rewrite all files.
+  Send that log to another machine, and compare with `-seal`.
+- **The recording** is in asciicast v2 format for `asciinema play`, with a marker
+  for each request. Typed keys are not recorded, but anything shown on screen
+  is, secrets included.
 
 ## Status
 
@@ -274,8 +281,8 @@ secrets included.
 | Forced SSH login | ✅ done |
 | QUIC transport | ✅ done |
 | Reconnecting by itself | ✅ done |
-| Audit logs and recording | 🚧 next |
-| File transfer: to the host with approval; from the host off by default | planned |
+| Audit logs and recording | ✅ done |
+| File transfer: to the host with approval; from the host off by default | 🚧 next |
 | Hardening, packaging, releases | planned |
 
 The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
@@ -331,6 +338,7 @@ max_sessions       = 0          # no limit
 detach_timeout     = "30m"
 exec_dirs          = ["/usr"]
 udp_port           = 60001      # 0 disables QUIC
+record_dir         = "/var/log/witnesshell"
 allow_weak_host    = false
 ```
 

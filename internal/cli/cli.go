@@ -32,7 +32,7 @@ var commands = map[string]command{
 	"daemon":    {summary: "run the session daemon (root)", run: runDaemon},
 	"attach":    {summary: "on this host: start, reattach to or witness a session", run: runAttach},
 	"sessions":  {summary: "list active sessions on this host", run: runSessions},
-	"audit":     {summary: "audit tools: 'audit verify <file.log>'", milestone: "M6"},
+	"audit":     {summary: "check the logs of a session: audit verify [-dir DIR] [-seal SHA256] SESSION-START", run: runAudit},
 	"version":   {summary: "print version information", run: runVersion},
 	"checksig":  {summary: "show whether a file is trusted or signed: checksig FILE", run: runChecksig},
 	"sign":      {summary: "sign a file on this host as a witness: sign [-sha256 HASH] FILE", run: runSign},
