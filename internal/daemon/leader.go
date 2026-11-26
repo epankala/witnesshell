@@ -32,6 +32,7 @@ type leaderConfig struct {
 	StoreDir string
 	Keys     sign.KeyDir
 	ExecDirs []string
+	Free     []string // free_commands
 }
 
 type leaderReq struct {
@@ -73,8 +74,15 @@ func Leader() error {
 		return err
 	}
 	store := &sign.Store{Dir: c.StoreDir, Keys: c.Keys, LookupUID: launch.LookupUID}
+	free := map[string]bool{}
+	for _, n := range c.Free {
+		if err := launch.CheckFree(n); err != nil {
+			return err
+		}
+		free[n] = true
+	}
 	s, err := runner.New(runner.Config{User: c.User, Policy: &launch.Policy{Store: store}, ExecDirs: c.ExecDirs,
-		TTY: os.Stdin, Dir: c.User.Home})
+		TTY: os.Stdin, Dir: c.User.Home, Free: free})
 	if err != nil {
 		return err
 	}

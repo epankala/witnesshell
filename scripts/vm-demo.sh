@@ -9,7 +9,7 @@ set -eu
 D=$(cd "$(dirname "$0")" && pwd)
 USERS="alice bob carol" # dropped into witsh
 
-install -m 755 "$D/witsh" /usr/local/bin/witsh
+install -m 755 "$D/witsh" /usr/local/bin/witsh.new && mv -f /usr/local/bin/witsh.new /usr/local/bin/witsh # also while it runs
 getent group witnesshell >/dev/null || groupadd -r witnesshell
 
 # Keys: each user's own, for logging in and for signatures.
@@ -77,6 +77,19 @@ done
 
 # The daemon, as a service, listening on the forwarded UDP port.
 printf 'approvals_required = 1\nudp_port = %s\n' "$(cat "$D/udp_port")" >/etc/witnesshell/config.toml
+# The suggested commands without approval (README).
+cat >>/etc/witnesshell/config.toml <<'EOF'
+free_commands = [
+  "cd", "jobs",                                                # shell builtins
+  "ls", "pwd", "cat", "head", "tail", "wc", "stat", "du", "df", # files
+  "realpath", "readlink", "basename", "dirname",
+  "grep", "cut", "tr", "nl", "cmp", "diff",                    # text
+  "sha256sum", "sha1sum", "md5sum", "b2sum",
+  "id", "whoami", "groups", "uname", "date", "uptime", "free", # the system
+  "ps", "w", "who", "nproc", "lsblk", "findmnt",
+  "printenv", "echo", "printf", "tty", "locale",
+]
+EOF
 cp "$D/deploy/witnesshell.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable -q witnesshell-harden.service witnesshell.service

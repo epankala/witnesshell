@@ -46,6 +46,7 @@
 | D36 | Ideally the connecting machines **already have all the data** the host has and look at it locally. On the host, content can always be viewed, and the **SHA-256 of a file** (big or binary) obtained to compare with local artifacts (`view`, `sha256`; §4.6) |
 | D37 | **If the daemon dies, its sessions die.** Each session leader holds a pidfd of the daemon and kills its own cgroup when the daemon ends, also while a program runs and if the daemon never starts again. The daemon is protected from the OOM killer (`OOMScoreAdjust=-900`); sessions reset that to 0, so one actor's memory use ends that session, not everybody's (M8) |
 | D38 | **Limits on what one user can make the daemon do:** a recording limit per session (`max_recording`, 1 GiB; a full recording ends the session, and its logs stay sealed), 4 sessions per actor, 4 starting at once, 20 submitted lines per 10 s, 2 queued `view` answers per client. A panic in a session's goroutine ends that session, not the daemon (M8) |
+| D39 | **Configurable commands without approval** (`free_commands`, empty by default; §4.6.1). A line is free only if every command in it is a listed bare name, found on the fixed `PATH`, trusted, without warnings, own variables, output redirection or `&`. Names that can run other programs or change files are refused when the configuration is loaded. Free lines are logged with exactly what ran |
 
 ## 1. Goal
 
@@ -323,6 +324,34 @@ None starts a program. Rules:
   with Ctrl-C, and does not hold up approvals. Witnesses have it too.
 - A viewed file can change before a command uses it. The SHA-256 lets a
   witness compare; for signed files the stored copy runs (§4.4).
+
+### 4.6.1 Configurable commands without approval (D39)
+
+`free_commands` lists programs that run without approval; none by default. A
+free one is what an approved one would be, with nobody asked:
+
+- **Every command of the line** must be listed, by the bare name typed (`ls`,
+  not `./ls` or `/usr/bin/ls`). Names are found on the fixed `SearchPath`, so
+  the actor cannot point one at another file.
+- The program passes the trust rules, as always, and has **no warnings**: an
+  interpreter under a listed name, for example a link `ls -> bash`, warns
+  "this allows unsigned code" and is not free.
+- **Nothing is written** by the line: no `>` or `>>`. `<` and `2>&1` are fine.
+- No `&`, no variables for one command (`X=1 ls`), no assignment lines.
+- Pipes and `&&`/`||`/`;` between free commands are free; `cd DIR && ...` only
+  if `cd` is listed. `cd` and `jobs` are the only builtins that may be listed.
+- Loading the configuration refuses names that can run other programs or
+  change files (`launch.CheckFree`): interpreters, wrappers, elevators,
+  pagers, editors, network and archive tools, and file-changing commands
+  including those that write through options (`sort -o`, `tree -o`,
+  `file -C`, `uniq IN OUT`). The leader checks again. The list cannot be
+  complete; it catches obvious mistakes.
+- Free lines are logged (`free_command`, with the details witnesses would
+  have seen) and recorded. While one runs, typed keys go to it, as with any
+  running program (D17); listed programs do nothing with them but read.
+
+The README suggests 43 programs that only read and show
+(`launch.SuggestedFree`); a test keeps the lists the same.
 
 ### 4.7 Daemon and clients (M2c, on one host)
 - `witsh daemon` (root) listens on `/run/witnesshell.sock`. The kernel

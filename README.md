@@ -103,6 +103,45 @@ Actor and witnesses can look at files (`view`), hash them (`sha256`) and check
 signatures (`checksig`) **without approval**, with their own file permissions. Neither
 starts another program.
 
+### Commands without approval
+
+The administrator may let some commands run without approval, with
+`free_commands` in the configuration. None by default. A line runs at once only
+if **every** command in it is listed and:
+
+- is a bare name, found on the fixed system `PATH` (`ls`, not `./ls` or
+  `/usr/bin/ls`), and is a trusted file;
+- writes to no file (`>` and `>>`; `<` and `2>&1` are fine);
+- does not run in the background (`&`) and sets no variables of its own
+  (`X=1 ls`).
+
+Pipes and `&&` between listed commands are fine, and so is `cd DIR && ...` when
+`cd` is listed. Free lines are logged and recorded like any other, with what
+exactly ran, and witnesses see them on screen.
+
+The daemon refuses to start if the list holds a command that can run other
+programs or change files: shells and interpreters, `env`, `sudo`, `find`,
+`xargs`, pagers such as `less` and `man`, editors, `git`, `ssh`, `tar`, `cp`,
+`rm`, `tee`, `sort` (`-o`), `file` (`-C`), and the builtins that change later
+commands (`export`, `unset`, `umask`, `fg`, `bg`). Free, any of these would be
+a shell that nobody witnesses. Commands that only read and show are suggested:
+
+```toml
+free_commands = [
+  "cd", "jobs",                                                # shell builtins
+  "ls", "pwd", "cat", "head", "tail", "wc", "stat", "du", "df", # files
+  "realpath", "readlink", "basename", "dirname",
+  "grep", "cut", "tr", "nl", "cmp", "diff",                    # text
+  "sha256sum", "sha1sum", "md5sum", "b2sum",
+  "id", "whoami", "groups", "uname", "date", "uptime", "free", # the system
+  "ps", "w", "who", "nproc", "lsblk", "findmnt",
+  "printenv", "echo", "printf", "tty", "locale",
+]
+```
+
+These still read with the actor's permissions and show what the actor may
+read: everyone watching sees it, so `cat` of a secret shows the secret.
+
 **Edits are reviewed by agreement, not by witnesshell.** There is no file-edit
 feature, and an approved editor can change anything the actor may. Keep
 configuration in git, and after an edit show `git diff` in the session.
@@ -377,6 +416,7 @@ allow_upload       = true
 allow_download     = false
 max_transfer       = "1GiB"
 max_recording      = "1GiB"     # per session; a full one ends the session
+free_commands      = []         # see "Commands without approval"
 allow_weak_host    = false
 ```
 

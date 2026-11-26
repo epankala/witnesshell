@@ -84,8 +84,8 @@ VMTEST_BINARY ?= $(DIST)/witsh-linux-amd64
 vm-test: vm-start $(VMTEST_BINARY)
 	$(GO) vet -tags vmtest ./test/vm
 	GOOS=linux GOARCH=amd64 $(GO) test -c -tags vmtest -o $(DIST)/vm.test ./test/vm
-	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/lib/vm.test && chmod 755 /usr/local/lib/vm.test"' <$(DIST)/vm.test
-	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/bin/witsh && chmod 755 /usr/local/bin/witsh"' <$(VMTEST_BINARY)
+	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/lib/vm.test.new && chmod 755 /usr/local/lib/vm.test.new && mv -f /usr/local/lib/vm.test.new /usr/local/lib/vm.test"' <$(DIST)/vm.test
+	@VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo sh -c "cat >/usr/local/bin/witsh.new && chmod 755 /usr/local/bin/witsh.new && mv -f /usr/local/bin/witsh.new /usr/local/bin/witsh"' <$(VMTEST_BINARY)
 	@tar -c deploy | VM_USER=vmadmin sh scripts/vm.sh ssh 'sudo rm -rf /usr/local/lib/deploy; sudo tar -x --no-same-owner -C /usr/local/lib'
 	@VM_USER=vmadmin sh scripts/vm.sh ssh 'cd / && sudo timeout 3600 /usr/local/lib/vm.test -test.v -test.timeout 3500s $(VMTEST_ARGS)' </dev/null
 

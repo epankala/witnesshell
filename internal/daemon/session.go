@@ -248,7 +248,7 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 		return fail(err)
 	}
 	defer cg.Close()
-	s.leader, s.ptm, s.dir, err = startLeader(leaderConfig{User: u, StoreDir: d.store.Dir, Keys: d.store.Keys, ExecDirs: d.c.ExecDirs}, cg, s.rows, s.cols)
+	s.leader, s.ptm, s.dir, err = startLeader(leaderConfig{User: u, StoreDir: d.store.Dir, Keys: d.store.Keys, ExecDirs: d.c.ExecDirs, Free: d.c.FreeCommands}, cg, s.rows, s.cols)
 	if err != nil {
 		return fail(err)
 	}
@@ -663,7 +663,7 @@ func (s *session) prepare(text string) {
 	if r.Free {
 		if _, err = s.gate.SubmitFree(); err == nil {
 			s.log.Info("free command", "text", text)
-			if _, ok := s.note(audit.Free, audit.Data{"text": text}, false); ok {
+			if _, ok := s.note(audit.Free, audit.Data{"text": text, "details": r.Details}, false); ok {
 				s.do(func() { s.run(r.Serial, audit.Data{"text": text}) })
 			}
 		}

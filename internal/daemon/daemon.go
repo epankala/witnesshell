@@ -50,6 +50,7 @@ type Config struct {
 	AllowWeakHost     bool     `toml:"allow_weak_host"`
 	UDPPort           int      `toml:"udp_port"` // 0 disables QUIC
 	ExecDirs          []string `toml:"exec_dirs"`
+	FreeCommands      []string `toml:"free_commands"` // run without approval (D39)
 	RecordDir         string   `toml:"record_dir"`
 	AllowUpload       bool     `toml:"allow_upload"`
 	AllowDownload     bool     `toml:"allow_download"`
@@ -85,6 +86,11 @@ func LoadConfig(name string) (Config, error) {
 	}
 	if c.maxRecording, err = parseSize(c.MaxRecording); err != nil {
 		return c, fmt.Errorf("%s: bad max_recording: %w", name, err)
+	}
+	for _, n := range c.FreeCommands {
+		if err := launch.CheckFree(n); err != nil {
+			return c, fmt.Errorf("%s: free_commands: %w", name, err)
+		}
 	}
 	if !filepath.IsAbs(c.RecordDir) {
 		return c, fmt.Errorf("%s: record_dir must be an absolute path", name)

@@ -37,6 +37,9 @@ type Config struct {
 	ExecDirs []string
 	TTY      *os.File // the controlling terminal
 	Dir      string
+	// Free are command names that run without approval (free_commands,
+	// D39), each allowed by launch.CheckFree.
+	Free map[string]bool
 }
 
 // Shell is one actor's shell. Run must not be called concurrently with
@@ -206,6 +209,7 @@ type Prepared struct {
 	cdTo    string // set for "cd DIR && ...": where Steps run
 	cdArgs  []string
 	gen     uint64
+	free    map[string]bool // see Config.Free
 }
 
 // Builtin returns a shell builtin's words, if that is what the line is.
@@ -213,7 +217,48 @@ func (p *Prepared) Builtin() []string { return p.builtin }
 
 // Free reports whether the line needs no approval.
 func (p *Prepared) Free() bool {
-	return p.builtin != nil && (p.builtin[0] == "view" || p.builtin[0] == "checksig" || p.builtin[0] == "sha256" || p.builtin[0] == "exit")
+	if p.builtin != nil {
+		switch p.builtin[0] {
+		case "view", "checksig", "sha256", "exit":
+			return true
+		}
+		return p.free[p.builtin[0]] && launch.CheckFree(p.builtin[0]) == nil
+	}
+	return p.freeLine()
+}
+
+// freeLine reports whether every command of the line is free: listed by
+// name, found on launch.SearchPath, trusted, without warnings, without
+// variables of its own and without writing to files. Pipes and && between
+// such commands are free too; running in the background is not.
+func (p *Prepared) freeLine() bool {
+	if len(p.Steps) == 0 || len(p.assigns) > 0 || p.cdTo != "" && !p.free["cd"] {
+		return false
+	}
+	for _, st := range p.Steps {
+		if st.Background {
+			return false
+		}
+		for _, c := range st.Cmds {
+			pl := c.Plan
+			name := pl.Argv[0]
+			if strings.Contains(name, "/") || !p.free[name] || launch.CheckFree(name) != nil ||
+				len(c.Env) > 0 || len(pl.Warnings) > 0 || !pl.Landlock || len(pl.Files) == 0 {
+				return false
+			}
+			for _, f := range pl.Files {
+				if !f.Trusted {
+					return false
+				}
+			}
+			for _, r := range c.Redirs {
+				if r.Kind == lang.Write || r.Kind == lang.Append {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // Describe tells witnesses exactly what will run. All text is safe to print.
@@ -337,7 +382,7 @@ func (s *Shell) Prepare(text string) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Prepared{Text: text, gen: s.gen}
+	p := &Prepared{Text: text, gen: s.gen, free: s.c.Free}
 	if len(line) == 0 {
 		return nil, errors.New("nothing to run")
 	}
