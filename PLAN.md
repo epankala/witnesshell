@@ -1,8 +1,13 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 to M8 done, all planned milestones (2026-11-26). v0.4
-> (2026-11-23) makes witnesshell itself the shell; the earlier bash code is
-> gone. No release has been tagged yet.
+> By epa@iki.fi. This document is licensed under
+> [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the code is MIT
+> (see [LICENSE](LICENSE)).
+
+> Status: **version 1.0.0** (2026-11-26): M0 to M8 done, all planned
+> milestones, and configurable commands without approval (D39). v0.4
+> (2026-11-23) made witnesshell itself the shell; the earlier bash code is
+> gone.
 
 ## 0. Decisions
 

@@ -62,10 +62,11 @@ STAMP := $(shell git log -1 --format=%cI 2>/dev/null || echo 1970-01-01T00:00:00
 .PHONY: release
 release: all
 	@case "$(VERSION)" in *dirty*) echo "warning: uncommitted changes in $(VERSION)";; esac
+	@GO='$(GO)' sh scripts/third-party.sh $(ARCHES) >$(DIST)/THIRD_PARTY_LICENSES
 	@set -e; cd $(DIST); rm -f witsh-*.tar.gz SHA256SUMS; \
 	for a in $(ARCHES); do \
 		n=witsh-$(VERSION)-linux-$$a; rm -rf $$n; mkdir -p $$n; \
-		cp witsh-linux-$$a $$n/witsh; \
+		cp witsh-linux-$$a $$n/witsh; cp THIRD_PARTY_LICENSES $$n/; \
 		(cd ..; cp -R $(RELEASE_FILES) $(DIST)/$$n/); \
 		tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='$(STAMP)' \
 			--mode=go-w -c $$n | gzip -n -9 >$$n.tar.gz; \
