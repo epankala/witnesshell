@@ -1,7 +1,8 @@
 # witnesshell — design & implementation plan (v0.4)
 
-> Status: M0 to M7 done. v0.4 (2026-11-23) makes witnesshell itself the
-> shell; the earlier bash code is gone. Next: M8.
+> Status: M0 to M8 done, all planned milestones (2026-11-26). v0.4
+> (2026-11-23) makes witnesshell itself the shell; the earlier bash code is
+> gone. No release has been tagged yet.
 
 ## 0. Decisions
 

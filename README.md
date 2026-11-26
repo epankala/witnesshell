@@ -316,10 +316,11 @@ witnesshell-<session start>-witness-<name>.log
 | Reconnecting by itself | ✅ done |
 | Audit logs and recording | ✅ done |
 | File transfer | ✅ done |
-| Hardening, packaging, releases | 🚧 next |
+| Hardening, packaging, releases | ✅ done |
 
-The design, decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been
-audited by a third party.
+All planned parts are done, but no release has been tagged yet. The design,
+decisions and reasons are in [PLAN.md](PLAN.md). Nothing has been audited by a
+third party.
 
 ## Installing
 
