@@ -414,6 +414,27 @@ make vm-list    # all VMs: state, pid, ports
 make vm-test-race  # the same tests with witsh built with the race detector
 ```
 
+To try it by hand, `make vm-demo` sets up the VM (or the one `VM=` names) as a
+real host:
+
+- alice, bob and carol log in to witsh; vmadmin logs in to bash, with root
+  through sudo.
+- Each user has a key of their own, made in `$VM_DIR/users`. Its public half is
+  in the user's `~/.ssh` and in `/etc/witnesshell/public_keys`, so signatures
+  by any of them are checked.
+- The daemon runs as a systemd service, and the host requirements are applied
+  at every boot.
+- `$VM_DIR/ssh_config` has an entry for each user:
+
+```sh
+make vm-demo
+ssh -F $VM_DIR/ssh_config vmadmin
+dist/witsh-linux-amd64 connect -F $VM_DIR/ssh_config alice    # in another terminal: bob
+```
+
+Run it again after changing witsh, or after `make vm-test`, which stops the
+daemon on that VM.
+
 `vm-test-race` needs a C compiler, and a VM whose C library is at least as new as
 the build machine's. Any data race fails the test it happened in.
 

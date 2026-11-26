@@ -115,6 +115,37 @@ seed() {
 	} >"$DIR/seed/user-data"
 }
 
+# demo BINARY makes the VM a host to log in to by hand (scripts/vm-demo.sh):
+# every user gets a key of their own in $DIR/users, and $DIR/ssh_config has an
+# entry for each.
+demo() {
+	[ -f "${1:-}" ] || { echo "usage: vm.sh demo WITSH-BINARY" >&2; exit 2; }
+	start
+	mkdir -p "$DIR/users"
+	chmod 700 "$DIR/users"
+	tmp=$(mktemp -d)
+	trap 'rm -rf "$tmp"' EXIT
+	mkdir "$tmp/keys"
+	: >"$DIR/ssh_config"
+	for u in vmadmin alice bob carol; do
+		[ -f "$DIR/users/$u" ] || ssh-keygen -q -t ed25519 -N '' -C "$u@$HOST" -f "$DIR/users/$u"
+		cp "$DIR/users/$u.pub" "$tmp/keys/"
+		printf 'Host %s\n\tHostName 127.0.0.1\n\tPort %s\n\tUser %s\n\tIdentityFile %s\n\tIdentitiesOnly yes\n\tUserKnownHostsFile %s\n\tStrictHostKeyChecking accept-new\n\n' \
+			"$u" "$PORT" "$u" "$DIR/users/$u" "$DIR/known_hosts" >>"$DIR/ssh_config"
+	done
+	cp "$1" "$tmp/witsh"
+	cp -R "$(dirname "$0")/../deploy" "$(dirname "$0")/vm-demo.sh" "$tmp/"
+	echo "$UDP" >"$tmp/udp_port"
+	tar -c -C "$tmp" . | VM_USER=vmadmin vmssh 'd=$(mktemp -d) && sudo tar -x --no-same-owner -C "$d" && sudo sh "$d/vm-demo.sh"; s=$?; sudo rm -rf "$d"; exit $s'
+	w=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+	cat <<EOF
+Ready. Log in with
+  ssh -F $DIR/ssh_config vmadmin                     # bash, root through sudo
+  $w connect -F $DIR/ssh_config alice   # also bob, carol: witsh
+Private keys are in $DIR/users.
+EOF
+}
+
 start() {
 	if running; then
 		echo "already running"
@@ -187,7 +218,8 @@ stop() {
 
 reset() {
 	stop
-	rm -f "$DIR/disk.qcow2" "$DIR/known_hosts"
+	rm -f "$DIR/disk.qcow2" "$DIR/known_hosts" "$DIR/ssh_config"
+	rm -rf "$DIR/users" # the keys of make vm-demo
 	if [ "$NAME" != default ]; then
 		rm -f "$DIR/key" "$DIR/key.pub" "$DIR/console.log" \
 			"$DIR/seed/meta-data" "$DIR/seed/user-data"
@@ -234,7 +266,8 @@ start) start ;;
 stop) stop ;;
 status) if running; then echo "running, ssh port $PORT"; else echo "stopped"; fi ;;
 ssh) shift; vmssh "$@" ;;
+demo) shift; demo "$@" ;;
 reset) reset ;;
 list) list ;;
-*) echo "usage: [VM=name] vm.sh start|stop|status|reset|list|ssh [command]" >&2; exit 2 ;;
+*) echo "usage: [VM=name] vm.sh start|stop|status|reset|list|ssh [command]|demo WITSH" >&2; exit 2 ;;
 esac

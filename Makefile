@@ -102,4 +102,11 @@ vm-test-race: $(DIST)/witsh-race
 vm-start vm-stop vm-status vm-ssh vm-reset vm-list: vm-%:
 	@sh scripts/vm.sh $*
 
+# A VM to log in to by hand: alice, bob and carol get witsh, vmadmin bash, each
+# with a key of their own. vm-test on the same VM stops its daemon; running
+# vm-demo again starts it.
+.PHONY: vm-demo
+vm-demo: $(DIST)/witsh-linux-amd64
+	@sh scripts/vm.sh demo $(DIST)/witsh-linux-amd64
+
 FORCE:
