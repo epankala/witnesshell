@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -35,6 +36,10 @@ const (
 	cgroupName    = "/witnesshell-sessions"
 	cgroupBase    = cgroupRoot + cgroupName
 	maxPerUser    = 32 // connections
+	// Sessions of one user, and sessions being started at once, each of which
+	// scans the host.
+	sessionsPerUser = 4
+	startingAtOnce  = 4
 )
 
 // Config is the configuration file.
@@ -50,13 +55,15 @@ type Config struct {
 	AllowDownload     bool     `toml:"allow_download"`
 	MaxTransfer       string   `toml:"max_transfer"` // of one file
 	maxTransfer       int64
+	MaxRecording      string `toml:"max_recording"` // of one session
+	maxRecording      int64
 	detach            time.Duration
 }
 
 // LoadConfig reads a configuration file. A missing file means defaults.
 func LoadConfig(name string) (Config, error) {
 	c := Config{ApprovalsRequired: 1, UDPPort: 60001, DetachTimeout: "30m", ExecDirs: []string{"/usr"}, RecordDir: audit.DefaultDir,
-		AllowUpload: true, MaxTransfer: "1GiB"}
+		AllowUpload: true, MaxTransfer: "1GiB", MaxRecording: "1GiB"}
 	md, err := toml.DecodeFile(name, &c)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return c, err
@@ -75,6 +82,9 @@ func LoadConfig(name string) (Config, error) {
 	}
 	if c.maxTransfer, err = parseSize(c.MaxTransfer); err != nil {
 		return c, fmt.Errorf("%s: bad max_transfer: %w", name, err)
+	}
+	if c.maxRecording, err = parseSize(c.MaxRecording); err != nil {
+		return c, fmt.Errorf("%s: bad max_recording: %w", name, err)
 	}
 	if !filepath.IsAbs(c.RecordDir) {
 		return c, fmt.Errorf("%s: record_dir must be an absolute path", name)
@@ -108,15 +118,16 @@ type Daemon struct {
 	store *sign.Store
 	log   *slog.Logger
 
-	mu       sync.Mutex
-	sessions []*session
-	starting int
-	conns    map[uint32]int
-	staged   int64 // bytes of files being copied
-	tokens   tokens
-	logins   logins
-	quic     *transport.Server // nil if disabled
-	last     time.Time
+	mu         sync.Mutex
+	sessions   []*session
+	starting   int
+	startingBy map[uint32]int
+	conns      map[uint32]int
+	staged     int64 // bytes of files being copied
+	tokens     tokens
+	logins     logins
+	quic       *transport.Server // nil if disabled
+	last       time.Time
 }
 
 // New prepares the daemon. It must run as root.
@@ -124,7 +135,7 @@ func New(c Config, log *slog.Logger) (*Daemon, error) {
 	if os.Getuid() != 0 {
 		return nil, errors.New("the daemon must run as root")
 	}
-	d := &Daemon{c: c, log: log, conns: map[uint32]int{}, store: &sign.Store{
+	d := &Daemon{c: c, log: log, conns: map[uint32]int{}, startingBy: map[uint32]int{}, store: &sign.Store{
 		Dir: sign.DefaultStoreDir, Keys: sign.KeyDir{Dir: sign.DefaultKeyDir}, LookupUID: launch.LookupUID}}
 	if err := d.store.Init(); err != nil {
 		return nil, err
@@ -184,7 +195,7 @@ func (d *Daemon) Serve(l *net.UnixListener) error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go d.handle(c)
+		go d.guard(nil, func() { d.handle(c) })
 	}
 }
 
@@ -201,7 +212,7 @@ func (d *Daemon) ServeQUIC() error {
 	d.quic = q
 	d.mu.Unlock()
 	go func() {
-		err := q.Serve(d.authQUIC, d.handleQUIC)
+		err := q.Serve(d.authQUIC, func(st *transport.Stream, uid uint32) { d.guard(nil, func() { d.handleQUIC(st, uid) }) })
 		if err != nil {
 			d.log.Error("QUIC", "err", err)
 		}
@@ -287,6 +298,20 @@ func peer(c *net.UnixConn) (uint32, error) {
 		}
 	}
 	return 0, errors.New("cannot tell where the connection comes from")
+}
+
+// guard runs f, so that a bug cannot stop the daemon and with it everybody's
+// sessions. A panic ends only the session it happened in, if any.
+func (d *Daemon) guard(s *session, f func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			d.log.Error("internal error", "panic", r, "stack", string(debug.Stack()))
+			if s != nil {
+				go s.end("internal error")
+			}
+		}
+	}()
+	f()
 }
 
 // handle serves a connection to the socket.
@@ -445,13 +470,30 @@ func (d *Daemon) find(u launch.User, q wire.Request) (*session, error) {
 	case !d.roomLocked():
 		d.mu.Unlock()
 		return nil, errors.New("the maximum number of sessions is reached")
+	case d.starting >= startingAtOnce:
+		d.mu.Unlock()
+		return nil, errors.New("too many sessions are starting; try again in a moment")
+	}
+	n := d.startingBy[u.UID]
+	for _, o := range d.sessions {
+		if o.actor.UID == u.UID {
+			n++
+		}
+	}
+	if n >= sessionsPerUser {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("you have %d sessions already", sessionsPerUser)
 	}
 	d.starting++
+	d.startingBy[u.UID]++
 	d.mu.Unlock()
 	s, err := d.start(u, q)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.starting--
+	if d.startingBy[u.UID]--; d.startingBy[u.UID] == 0 {
+		delete(d.startingBy, u.UID)
+	}
 	if err != nil {
 		return nil, err
 	}

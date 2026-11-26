@@ -86,6 +86,9 @@ func (l *logFile) add(event string, d Data, durable bool) (string, error) {
 // ErrClosed means that the session's logs are complete.
 var ErrClosed = errors.New("the logs are closed")
 
+// ErrFull means that the recording reached its limit.
+var ErrFull = errors.New("the recording reached its limit")
+
 // Session is the logs and the recording of one session.
 type Session struct {
 	dir, id string
@@ -204,6 +207,13 @@ func (s *Session) Witness(uid uint32, name, event string, d Data, durable bool) 
 	return s.failed(err)
 }
 
+// LimitRecording sets the largest size of the recording; 0 means no limit.
+func (s *Session) LimitRecording(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cast.limit = n
+}
+
 // Output, Resize and Marker add to the recording.
 func (s *Session) Output(b []byte) error {
 	return s.record(func() error { return s.cast.output(b) })
@@ -234,6 +244,9 @@ func (s *Session) Close(why string) (string, error) {
 		return "", ErrClosed
 	}
 	failure := s.err
+	if errors.Is(failure, ErrFull) {
+		failure = nil // what there is, is complete
+	}
 	s.err = ErrClosed
 	defer func() {
 		for _, l := range s.witnesses {

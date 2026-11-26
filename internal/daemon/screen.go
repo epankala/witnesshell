@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"witnesshell/internal/launch"
 	"witnesshell/internal/screen"
 	"witnesshell/internal/wire"
 )
@@ -30,6 +31,10 @@ const (
 func Screen() error {
 	if os.Getuid() == 0 {
 		return errors.New("must not be root")
+	}
+	// Before its /proc files become root's.
+	if err := notProtected(); err != nil {
+		return err
 	}
 	if err := errors.Join(unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0), unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)); err != nil {
 		return err
@@ -74,7 +79,7 @@ func (p *screenProc) start() error {
 	}
 	defer cg.Close()
 	cmd := exec.Command("/proc/self/exe", ScreenArg)
-	cmd.Env, cmd.Dir = []string{}, "/"
+	cmd.Env, cmd.Dir = launch.ChildEnv(), "/"
 	cmd.Stdin, cmd.Stdout = inR, outW
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, UseCgroupFD: true, CgroupFD: int(cg.Fd()),
 		Credential: &syscall.Credential{Uid: nobody, Gid: nobody}}

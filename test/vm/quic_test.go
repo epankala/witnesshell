@@ -344,8 +344,21 @@ ip netns exec wt ip link set lo up; ip netns exec wt ip addr add 10.9.0.2/24 dev
 	b.approve("before")
 	a.wait("PROMPT")
 	sh(t, "ip netns exec wt ip addr del 10.9.0.2/24 dev wt1; ip netns exec wt ip addr add 10.9.0.77/24 dev wt1")
-	a.typ("touch MARK")
-	a.wait("$ touch MARK")
+	// Keys typed before the host hears from the new address are dropped, not
+	// kept for later; a slow build may take a while to get there.
+	for i := 0; ; i++ {
+		a.typ("touch MARK")
+		end := time.Now().Add(5 * time.Second)
+		for !a.has("$ touch MARK") && time.Now().Before(end) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if a.has("$ touch MARK") {
+			break
+		}
+		if i == 6 {
+			t.Fatalf("typing is lost after the address changed:\n%s", a.screen())
+		}
+	}
 	a.typ("\r")
 	b.approve("MARK")
 	a.wait("PROMPT")

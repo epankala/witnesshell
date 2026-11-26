@@ -351,7 +351,7 @@ func (s *session) approved(about audit.Data) {
 	}
 	s.checking = true // nothing else meanwhile
 	umask := uint32(s.umask)
-	go func() {
+	s.do(func() {
 		err := transfer.Place(s.actor, t.dest, t.file, t.size, t.hash, umask)
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -369,7 +369,7 @@ func (s *session) approved(about audit.Data) {
 			s.broadcast()
 		}
 		t.result <- err
-	}()
+	})
 }
 
 // showStaged shows a witness the file of the pending transfer, or what it

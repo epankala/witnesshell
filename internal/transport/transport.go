@@ -195,7 +195,12 @@ func (s *Server) serve(c *quic.Conn, auth Auth, handle func(*Stream, uint32)) {
 		return
 	}
 	defer func() {
-		// Only a client that says so has quit; others may come back.
+		// Only a client that says so has quit; others may come back. Why the
+		// connection ended is known only once it has.
+		select {
+		case <-c.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
 		var ae *quic.ApplicationError
 		a.Ended(errors.As(context.Cause(c.Context()), &ae) && ae.Remote && ae.ErrorCode == codeQuit)
 	}()

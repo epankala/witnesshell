@@ -38,7 +38,7 @@ func Start(p *Plan, o Options) (*exec.Cmd, error) {
 	defer w.Close()
 	cmd := exec.Command("/proc/self/exe", HelperArg)
 	cmd.Args[0] = "witsh"
-	cmd.Env = []string{}
+	cmd.Env = ChildEnv()
 	cmd.Dir = "/"
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = o.Stdin, o.Stdout, o.Stderr
 	cmd.ExtraFiles = []*os.File{r}

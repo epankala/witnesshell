@@ -226,3 +226,26 @@ func FuzzVerify(f *testing.F) {
 		}
 	})
 }
+
+func TestRecordingLimit(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, id, "alice", 1, nil, 24, 80, time.Now())
+	must(t, err)
+	s.LimitRecording(400)
+	must(t, s.Output([]byte(strings.Repeat("x", 100))))
+	if err := s.Output([]byte(strings.Repeat("x", 300))); !errors.Is(err, ErrFull) {
+		t.Fatal(err)
+	}
+	if _, err := s.Actor(Vote, nil, true); !errors.Is(err, ErrFull) {
+		t.Fatal("logging went on")
+	}
+	_, err = s.Close("full")
+	must(t, err)
+	r, err := Verify(dir, id)
+	if err != nil || len(r.Problems) != 0 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if st, _ := os.Stat(filepath.Join(dir, name("actor", "alice", ".cast"))); st.Size() > 400 {
+		t.Fatal(st.Size())
+	}
+}

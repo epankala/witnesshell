@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -57,6 +59,9 @@ func Leader() error {
 	unix.CloseOnExec(4)
 	if os.Getuid() != 0 {
 		return errors.New("must be root")
+	}
+	if err := errors.Join(watchDaemon(), notProtected()); err != nil {
+		return err
 	}
 	dec, enc := json.NewDecoder(in), json.NewEncoder(out)
 	var c leaderConfig
@@ -109,6 +114,68 @@ func Leader() error {
 	}
 }
 
+// watchDaemon ends the session if the daemon, the leader's parent, ends
+// without ending it: nothing may run that is not logged. The daemon kills old
+// sessions when it starts again, but it may not start again, and the leader
+// does not hear from it while a program runs. So the leader watches it, and
+// kills its own cgroup, itself included.
+func watchDaemon() error {
+	parent := os.Getppid()
+	pidfd, err := unix.PidfdOpen(parent, 0)
+	if err != nil {
+		return fmt.Errorf("watching the daemon: %w", err)
+	}
+	if os.Getppid() != parent { // it ended before it was watched
+		return errors.New("the daemon has ended")
+	}
+	kill, err := ownCgroupKill()
+	if err != nil {
+		return err
+	}
+	// The terminal hangs up when the daemon dies, which would end the leader
+	// first: the hangup must end the session the same way. A hangup means
+	// the session is over anyway.
+	over := make(chan os.Signal, 2)
+	signal.Notify(over, unix.SIGHUP)
+	go func() {
+		fds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+		for {
+			if _, err := unix.Poll(fds, -1); err != unix.EINTR {
+				break
+			}
+		}
+		over <- unix.SIGKILL
+	}()
+	go func() {
+		<-over
+		_, _ = kill.WriteString("1")
+		os.Exit(1)
+	}()
+	return nil
+}
+
+// notProtected gives up the daemon's protection from the OOM killer, which
+// children inherit (OOMScoreAdjust in the systemd unit). The daemon ending
+// ends all sessions, so a session that uses too much memory must be killed
+// instead.
+func notProtected() error {
+	return os.WriteFile("/proc/self/oom_score_adj", []byte("0"), 0)
+}
+
+// ownCgroupKill opens cgroup.kill of the session's cgroup, the one this
+// process is in.
+func ownCgroupKill() (*os.File, error) {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return nil, err
+	}
+	p, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "0::")
+	if !ok || !strings.HasPrefix(p, cgroupName+"/") || strings.Contains(p, "\n") || strings.Contains(p, "..") {
+		return nil, fmt.Errorf("not in a session's cgroup: %q", b)
+	}
+	return os.OpenFile(cgroupRoot+p+"/cgroup.kill", os.O_WRONLY, 0)
+}
+
 // leader is the daemon's handle on a leader process.
 type leader struct {
 	mu   sync.Mutex
@@ -144,7 +211,7 @@ func startLeader(c leaderConfig, cgroup *os.File, rows, cols uint16) (*leader, *
 		return nil, nil, "", err
 	}
 	cmd := exec.Command("/proc/self/exe", TerminalArg)
-	cmd.Env = []string{}
+	cmd.Env = launch.ChildEnv()
 	cmd.Dir = "/"
 	cmd.Stderr = os.Stderr // until there is a terminal
 	cmd.ExtraFiles = []*os.File{inR, outW, theirs}

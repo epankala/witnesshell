@@ -7,6 +7,9 @@ ExecStart=/usr/local/bin/witsh daemon
 Restart=on-failure
 # The daemon ends its sessions itself; they live in their own cgroups.
 KillMode=process
+# If the daemon ends, all sessions end. Sessions give this up (OOM score 0), so
+# the OOM killer takes a session that uses too much memory, not everybody's.
+OOMScoreAdjust=-900
 TimeoutStopSec=30
 UMask=0077
 

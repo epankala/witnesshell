@@ -202,6 +202,7 @@ type session struct {
 	transfer   *pendingTransfer // that the pending request is about, if any
 	staging    bool             // a transfer is going on
 	umask      int
+	entered    []time.Time // see mayEnter
 	details    []string
 	warnings   []string
 	dir        string
@@ -268,7 +269,8 @@ func (d *Daemon) newSession(u launch.User, weak []string, rows, cols uint16) (*s
 		s.notice = "this host does not meet the requirements; protection is weaker"
 	}
 	s.log.Info("session started", "weak", weak)
-	go s.pump()
+	s.audit.LimitRecording(d.c.maxRecording)
+	s.do(s.pump)
 	go func() {
 		<-s.leader.done
 		s.end("the shell ended")
@@ -312,10 +314,17 @@ func (s *session) pump() {
 func (s *session) logged(err error) bool {
 	if err != nil && !errors.Is(err, audit.ErrClosed) {
 		s.log.Error("cannot log", "err", err)
-		go s.end("the session can no longer be logged")
+		why := "the session can no longer be logged"
+		if errors.Is(err, audit.ErrFull) {
+			why = "the recording reached its limit (max_recording)"
+		}
+		go s.end(why)
 	}
 	return err == nil
 }
+
+// do runs f in the background, guarded (see Daemon.guard).
+func (s *session) do(f func()) { go s.d.guard(s, f) }
 
 // note adds an event to the actor's log, and to those of witnesses who are
 // there if asked to. It is on disk afterwards. Lock held.
@@ -537,6 +546,26 @@ func (s *session) broadcast() {
 	}
 }
 
+// Submissions in a while, at most: each is logged.
+const (
+	maxEntered = 20
+	enterTime  = 10 * time.Second
+)
+
+// maxDocs is how many viewed files may wait to be sent to one client.
+const maxDocs = 2
+
+// mayEnter counts a submission. Lock held.
+func (s *session) mayEnter() bool {
+	now := time.Now()
+	s.entered = slices.DeleteFunc(s.entered, func(t time.Time) bool { return now.Sub(t) > enterTime })
+	if len(s.entered) >= maxEntered {
+		return false
+	}
+	s.entered = append(s.entered, now)
+	return true
+}
+
 // key handles bytes typed by the actor.
 func (s *session) key(data []byte) {
 	s.mu.Lock()
@@ -589,10 +618,14 @@ func (s *session) keyLocked(data []byte) (logout bool) {
 				return true
 			}
 		case evEnter:
+			if !s.mayEnter() {
+				s.notice = "too many lines at once; wait a moment"
+				break
+			}
 			if d, _ := s.gate.Draft(); s.gate.State() == gate.Prompt && strings.TrimSpace(d) != "" {
 				s.checking = true
 				s.keys.reset() // what was typed ahead does not count
-				go s.prepare(d)
+				s.do(func() { s.prepare(d) })
 			}
 		case evBad:
 			s.notice = "that key does nothing here"
@@ -631,7 +664,7 @@ func (s *session) prepare(text string) {
 		if _, err = s.gate.SubmitFree(); err == nil {
 			s.log.Info("free command", "text", text)
 			if _, ok := s.note(audit.Free, audit.Data{"text": text}, false); ok {
-				go s.run(r.Serial, audit.Data{"text": text})
+				s.do(func() { s.run(r.Serial, audit.Data{"text": text}) })
 			}
 		}
 	} else {
@@ -702,7 +735,11 @@ func (s *session) vote(c *client, q wire.Request) error {
 	if err != nil {
 		return err
 	}
-	s.log.Info("vote", "id", q.ID, "by", c.user.Name, "approve", q.Approve, "comment", q.Text, "outcome", r.Outcome.String())
+	comment := ""
+	if !q.Approve {
+		comment = strings.TrimSpace(q.Text) // checked by Reject; an approval has none
+	}
+	s.log.Info("vote", "id", q.ID, "by", c.user.Name, "approve", q.Approve, "comment", comment, "outcome", r.Outcome.String())
 	d := audit.Data{"id": q.ID, "request_hash": s.request, "by": c.user.Name, "uid": c.user.UID, "approve": q.Approve, "outcome": r.Outcome.String()}
 	if !q.Approve {
 		d["comment"] = strings.TrimSpace(q.Text)
@@ -732,7 +769,8 @@ func (s *session) vote(c *client, q wire.Request) error {
 		if outside {
 			s.approved(run)
 		} else {
-			go s.run(s.serial, run)
+			serial := s.serial
+			s.do(func() { s.run(serial, run) })
 		}
 	case gate.Rejected:
 		s.drop(fmt.Sprintf("rejected by %s: %s", c.user.Name, strings.TrimSpace(q.Text)))
@@ -818,13 +856,13 @@ func (s *session) serve(c *client) {
 				s.reply(c, wire.Reply{Type: wire.Error, Text: err.Error()})
 			}
 		case !c.actor && (q.Type == wire.View || q.Type == wire.Checksig):
-			if len(c.out) > 16 { // large answers must not pile up
+			if len(c.out) >= maxDocs { // large answers must not pile up
 				s.reply(c, wire.Reply{Type: wire.Error, Text: "too many requests"})
 				continue
 			}
 			s.reply(c, s.inspect(c, q, s.d.store))
 		case !c.actor && (q.Type == wire.Staged || q.Type == wire.Changes):
-			if len(c.out) > 16 {
+			if len(c.out) >= maxDocs {
 				s.reply(c, wire.Reply{Type: wire.Error, Text: "too many requests"})
 				continue
 			}
@@ -838,7 +876,7 @@ func (s *session) serve(c *client) {
 				s.reply(c, wire.Reply{Type: wire.Error, Text: "still busy with the last one"})
 				continue
 			}
-			go s.hash(c, q)
+			s.do(func() { s.hash(c, q) })
 		case !c.actor && q.Type == wire.Sign:
 			r := wire.Reply{Type: wire.OK, Text: "signed"}
 			if err := s.d.sign(c.user, q.Text); err != nil {

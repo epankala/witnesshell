@@ -43,6 +43,8 @@
 | D34 | **Files can be copied from the client to the host** (§4.8) |
 | D35 | **Copying from the host to the client is optional and NOT permitted by default.** Only root can enable it, in the config |
 | D36 | Ideally the connecting machines **already have all the data** the host has and look at it locally. On the host, content can always be viewed, and the **SHA-256 of a file** (big or binary) obtained to compare with local artifacts (`view`, `sha256`; §4.6) |
+| D37 | **If the daemon dies, its sessions die.** Each session leader holds a pidfd of the daemon and kills its own cgroup when the daemon ends, also while a program runs and if the daemon never starts again. The daemon is protected from the OOM killer (`OOMScoreAdjust=-900`); sessions reset that to 0, so one actor's memory use ends that session, not everybody's (M8) |
+| D38 | **Limits on what one user can make the daemon do:** a recording limit per session (`max_recording`, 1 GiB; a full recording ends the session, and its logs stay sealed), 4 sessions per actor, 4 starting at once, 20 submitted lines per 10 s, 2 queued `view` answers per client. A panic in a session's goroutine ends that session, not the daemon (M8) |
 
 ## 1. Goal
 

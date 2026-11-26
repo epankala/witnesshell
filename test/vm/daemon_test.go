@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,22 +30,46 @@ const (
 	sock   = "/run/witnesshell.sock"
 )
 
+// daemonCmd is the daemon that startDaemon started last.
+var daemonCmd *exec.Cmd
+
 // startDaemon runs the real daemon.
 func startDaemon(t *testing.T, config string) *bytes.Buffer {
 	t.Helper()
 	must(os.WriteFile("/etc/witnesshell/config.toml", []byte(config), 0o644))
 	var log bytes.Buffer
 	cmd := exec.Command(binary, "daemon")
+	// A build with the race detector reports there, from all processes.
+	_ = os.RemoveAll("/var/log/witsh-race")
+	cmd.Env = append(os.Environ(), "GORACE=log_path=/var/log/witsh-race/report halt_on_error=0")
+	must(os.MkdirAll("/var/log/witsh-race", 0o777))
 	cmd.Stderr = &log
 	must(cmd.Start())
+	daemonCmd = cmd
+	// As OOMScoreAdjust in the systemd unit does.
+	must(os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", cmd.Process.Pid), []byte("-900"), 0))
 	t.Cleanup(func() {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 		_ = cmd.Wait()
+		if reports, _ := filepath.Glob("/var/log/witsh-race/report*"); len(reports) > 0 {
+			for _, r := range reports {
+				b, _ := os.ReadFile(r)
+				t.Errorf("DATA RACE in %s:\n%s", r, b)
+			}
+		}
 		if t.Failed() {
 			t.Logf("daemon log:\n%s", log.String())
 		}
-		if out, _ := exec.Command("pgrep", "-f", "__session|__terminal|__screen").Output(); len(out) != 0 {
-			t.Errorf("session processes left: %s", out)
+		for i := 0; ; i++ {
+			out, _ := exec.Command("pgrep", "-a", "-f", "__session|__terminal|__screen").Output()
+			if len(out) == 0 {
+				break
+			}
+			if i == 30 {
+				t.Errorf("session processes left: %s", out)
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	})
 	for range 100 {
@@ -730,7 +755,7 @@ func TestDaemonWeakHostIsShown(t *testing.T) {
 }
 
 func TestDaemonConfigStrict(t *testing.T) {
-	for _, c := range []string{"approvals_required = 0", "nonsense = 1", "detach_timeout = \"x\"", "exec_dirs = [\"rel\"]", "max_sessions = -1", "udp_port = 70000", "record_dir = \"x\"", "max_transfer = \"0\"", "max_transfer = \"5 parsecs\"", "max_transfer = \"9999999TiB\"", "allow_download = \"yes\"", "approvals_required = \"2\""} {
+	for _, c := range []string{"approvals_required = 0", "nonsense = 1", "detach_timeout = \"x\"", "exec_dirs = [\"rel\"]", "max_sessions = -1", "udp_port = 70000", "record_dir = \"x\"", "max_transfer = \"0\"", "max_transfer = \"5 parsecs\"", "max_transfer = \"9999999TiB\"", "allow_download = \"yes\"", "max_recording = \"0\"", "max_recording = \"lots\"", "approvals_required = \"2\""} {
 		must(os.WriteFile("/etc/witnesshell/config.toml", []byte(c), 0o644))
 		cmd := exec.Command("timeout", "3", binary, "daemon")
 		if err := cmd.Run(); err == nil || cmd.ProcessState.ExitCode() == 124 {

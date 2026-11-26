@@ -103,6 +103,12 @@ Actor and witnesses can look at files (`view`), hash them (`sha256`) and check
 signatures (`checksig`) **without approval**, with their own file permissions. Neither
 starts another program.
 
+**Edits are reviewed by agreement, not by witnesshell.** There is no file-edit
+feature, and an approved editor can change anything the actor may. Keep
+configuration in git, and after an edit show `git diff` in the session.
+Witnesses should refuse to approve anything that uses a file whose changes they
+have not seen.
+
 ## Validation: what may run
 
 | File | May run? |
@@ -283,7 +289,10 @@ witnesshell-<session start>-witness-<name>.log
 
 - **Nothing runs unlogged.** Entries are on disk before a command starts. If
   something cannot be logged, the session ends. A full disk stops all work, so
-  give the logs a filesystem that actors cannot fill.
+  give the logs a filesystem that actors cannot fill. If the daemon itself dies,
+  every session ends with it.
+- **Recordings have a limit**, `max_recording` per session (1 GiB by default).
+  A session whose recording is full ends; its logs stay complete and sealed.
 - **Changes are noticed.** Each log is a chain of hashes, and the end of the actor
   log seals the witness logs and the recording:
   `witsh audit verify <session start>`.
@@ -366,8 +375,12 @@ record_dir         = "/var/log/witnesshell"
 allow_upload       = true
 allow_download     = false
 max_transfer       = "1GiB"
+max_recording      = "1GiB"     # per session; a full one ends the session
 allow_weak_host    = false
 ```
+
+Fixed limits: 4 sessions per actor, 4 sessions starting at once, and 20
+submitted lines per 10 seconds, since each is logged.
 
 ## Building
 
@@ -378,7 +391,11 @@ dependencies.
 make            # format check, vet, tests, build amd64 and arm64, verify static
 make build      # just dist/witsh-linux-{amd64,arm64}
 make check      # just format check, vet and tests
+make release    # all of the above, then dist/witsh-VERSION-linux-ARCH.tar.gz and SHA256SUMS
 ```
+
+Release archives hold the binary, `deploy/` and the documentation. The same
+commit always gives the same bytes, so anyone can rebuild and compare the sums.
 
 ## Testing
 
@@ -394,7 +411,11 @@ make vm-status
 make vm-stop    # keeps the disk
 make vm-reset   # stops and discards the disk
 make vm-list    # all VMs: state, pid, ports
+make vm-test-race  # the same tests with witsh built with the race detector
 ```
+
+`vm-test-race` needs a C compiler, and a VM whose C library is at least as new as
+the build machine's. Any data race fails the test it happened in.
 
 Add `VM=name` to any of these, except `vm-list`, to use another VM beside the
 default one, for example `make vm-start VM=web`. Each gets its own disk, key,
@@ -405,4 +426,8 @@ once. The UDP port is the same inside the VM, so set `udp_port` there to the one
 
 VM accounts: `vmadmin` (root through sudo), `alice` (sudo with password `test`),
 `bob` and `carol`. Settings such as `VM_DIR` and `VM_SSH_PORT` can go in an
-untracked `local.mk`. Only amd64 has been tested; arm64 is built but untested.
+untracked `local.mk`.
+
+The attack tests have run on amd64 only. On arm64 the unit tests pass under
+QEMU's user-mode emulator, `make test-arm64` (`QEMU_AARCH64` names it), but
+nothing that needs root has run on an arm64 kernel.

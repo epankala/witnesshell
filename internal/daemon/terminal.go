@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"witnesshell/internal/launch"
 	"witnesshell/internal/pty"
 )
 
@@ -58,7 +59,7 @@ func Terminal() error {
 		}
 	}
 	_ = unix.Close(5)
-	return syscall.Exec("/proc/self/exe", []string{"witsh", LeaderArg}, []string{})
+	return syscall.Exec("/proc/self/exe", []string{"witsh", LeaderArg}, launch.ChildEnv())
 }
 
 // ptmxDevice makes sure that /dev/ptmx opens the new instance. The usual

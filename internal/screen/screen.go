@@ -20,6 +20,7 @@ import (
 // Emulator is a terminal.
 type Emulator struct {
 	em         *vt.Emulator
+	drained    chan struct{} // closed when nothing reads em any more
 	rows, cols int
 	appKeys    bool
 	paste      bool
@@ -37,9 +38,7 @@ func New(rows, cols int) *Emulator {
 }
 
 func (e *Emulator) reset(rows, cols int) {
-	if e.em != nil {
-		_ = e.em.Close()
-	}
+	e.Close()
 	e.rows, e.cols, e.appKeys, e.paste = rows, cols, false, false
 	e.em = vt.NewEmulator(cols, rows)
 	e.em.SetScrollbackSize(1)
@@ -49,11 +48,27 @@ func (e *Emulator) reset(rows, cols int) {
 		DisableMode: func(m ansi.Mode) { e.mode(m, false) },
 	})
 	// Answers to queries are dropped: they would become typed input.
-	go func(em *vt.Emulator) { _, _ = io.Copy(io.Discard, em) }(e.em)
+	e.drained = make(chan struct{})
+	go func(em *vt.Emulator, done chan struct{}) {
+		defer close(done)
+		_, _ = io.Copy(io.Discard, em)
+	}(e.em, e.drained)
 }
 
-// Close frees the terminal.
-func (e *Emulator) Close() { _ = e.em.Close() }
+// Close frees the terminal. The emulator's own Close may not be called while
+// something reads it: its flag for that is not synchronised. So the reading is
+// ended first, by closing the other end of its pipe.
+func (e *Emulator) Close() {
+	if e.em == nil {
+		return
+	}
+	if w, ok := e.em.InputPipe().(*io.PipeWriter); ok {
+		_ = w.Close()
+		<-e.drained
+	}
+	_ = e.em.Close()
+	e.em = nil
+}
 
 // mode notes the harmless input modes that the actor's keyboard must follow.
 func (e *Emulator) mode(m ansi.Mode, on bool) {

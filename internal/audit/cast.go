@@ -20,6 +20,8 @@ type cast struct {
 	began time.Time
 	sum   hash.Hash
 	rest  []byte // the beginning of a character whose end is still to come
+	size  int64  // written so far
+	limit int64  // of the size; 0 means none
 }
 
 func newCast(l *logFile, title string, rows, cols uint16, began time.Time) (*cast, error) {
@@ -34,6 +36,10 @@ func (c *cast) line(v any) error {
 		return err
 	}
 	b = append(b, '\n')
+	if c.limit > 0 && c.size+int64(len(b)) > c.limit {
+		return ErrFull
+	}
+	c.size += int64(len(b))
 	if _, err := c.f.Write(b); err != nil {
 		return err
 	}

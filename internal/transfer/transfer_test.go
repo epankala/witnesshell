@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -207,6 +208,68 @@ func TestDiff(t *testing.T) {
 	if _, err := Diff(make([]string, maxDiffLines+1), nil); err == nil {
 		t.Error("no limit")
 	}
+}
+
+// FuzzDiff checks a diff against the texts it compares: applied to the old
+// lines it must give the new ones, empty texts included.
+func FuzzDiff(f *testing.F) {
+	f.Add("a\nb\nc\n", "a\nc\nd\n")
+	f.Add("", "x\n")
+	f.Add("x", "")
+	f.Add("same\n", "same\n")
+	f.Fuzz(func(t *testing.T, a, b string) {
+		if len(a) > 2048 || len(b) > 2048 {
+			return
+		}
+		old, new := strings.Split(a, "\n"), strings.Split(b, "\n")
+		d, err := Diff(old, new)
+		if err != nil {
+			return
+		}
+		if got := applyDiff(t, old, d); !slices.Equal(got, new) {
+			t.Fatalf("diff of %q and %q:\n%s\ngives %q", a, b, strings.Join(d, "\n"), got)
+		}
+	})
+}
+
+// applyDiff applies what Diff returns, strictly.
+func applyDiff(t *testing.T, old, d []string) []string {
+	var out []string
+	at := 0 // in old
+	line := func(l string) string {
+		if at >= len(old) || old[at] != l {
+			t.Fatalf("%q does not match line %d of %q", l, at, old)
+		}
+		return old[at]
+	}
+	for _, l := range d {
+		switch {
+		case strings.HasPrefix(l, "@@ "):
+			var a, na, b, nb int
+			if _, err := fmt.Sscanf(l, "@@ -%d,%d +%d,%d @@", &a, &na, &b, &nb); err != nil {
+				t.Fatalf("hunk %q: %v", l, err)
+			}
+			if a-1 < at || a-1 > len(old) {
+				t.Fatalf("hunk %q at line %d", l, at)
+			}
+			out = append(out, old[at:a-1]...)
+			at = a - 1
+			if len(out) != b-1 {
+				t.Fatalf("hunk %q, but %d lines came before", l, len(out))
+			}
+		case strings.HasPrefix(l, " "):
+			out = append(out, line(l[1:]))
+			at++
+		case strings.HasPrefix(l, "-"):
+			line(l[1:])
+			at++
+		case strings.HasPrefix(l, "+"):
+			out = append(out, l[1:])
+		default:
+			t.Fatalf("line %q", l)
+		}
+	}
+	return append(out, old[at:]...)
 }
 
 // TestDiffApplies checks random diffs with the real patch program.
